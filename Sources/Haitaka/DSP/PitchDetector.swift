@@ -1,0 +1,113 @@
+import Foundation
+
+public struct PitchDetector: Sendable {
+    public let config: DSPConfig
+    
+    public init(config: DSPConfig = DSPConfig()) {
+        self.config = config
+    }
+    
+    /// Estimates F0 (Hz) and HNR (dB) from one frame.
+    @inline(__always)
+    public func detectPitch(
+        ptr: UnsafePointer<Float>,
+        count: Int,
+        workspace: DSPWorkspace
+    ) -> PitchResult {
+        if count < config.maxPitchLag + 8 {
+            return PitchResult(f0: 0.0, hnr: 0.0, isVoiced: false)
+        }
+        
+        let frameSize = count
+        let maxAbs = VectorOperations.maxMagnitude(ptr: ptr, count: frameSize)
+        if maxAbs < 1e-4 {
+            return PitchResult(f0: 0.0, hnr: 0.0, isVoiced: false)
+        }
+
+        // Signal energy and normalized autocorrelation
+        let calcLength = frameSize - config.maxPitchLag
+        let e0 = VectorOperations.sumOfSquares(ptr: ptr, count: calcLength)
+        if e0 < 1e-6 {
+            return PitchResult(f0: 0.0, hnr: 0.0, isVoiced: false)
+        }
+        
+        var lag = config.minPitchLag
+        let maxLag = config.maxPitchLag
+        let rValues = workspace.pitchAutocorr.withUnsafeMutableBufferPointer { $0.baseAddress! }
+        
+        while lag <= maxLag {
+            let rawLagPtr = ptr.advanced(by: lag)
+            let dotRaw = VectorOperations.dotProduct(a: ptr, b: rawLagPtr, count: calcLength)
+            let eLag = VectorOperations.sumOfSquares(ptr: rawLagPtr, count: calcLength)
+            let denom = sqrt(e0 * eLag)
+            var normR: Float = 0.0
+            if 1e-6 <= denom {
+                normR = dotRaw / denom
+            }
+            rValues[lag] = normR
+            lag += 1
+        }
+        
+        // Local maxima (stored in workspace buffers)
+        var globalMaxR: Float = -Float.greatestFiniteMagnitude
+        let peaksLag = workspace.pitchPeaksLag.withUnsafeMutableBufferPointer { $0.baseAddress! }
+        let peaksR = workspace.pitchPeaksR.withUnsafeMutableBufferPointer { $0.baseAddress! }
+        var peakCount = 0
+        
+        lag = config.minPitchLag + 1
+        while lag < maxLag {
+            let prevR = rValues[lag-1]
+            let currR = rValues[lag]
+            let nextR = rValues[lag+1]
+            
+            if prevR < currR && nextR < currR {
+                peaksLag[peakCount] = lag
+                peaksR[peakCount] = currR
+                peakCount += 1
+                if globalMaxR < currR {
+                    globalMaxR = currR
+                }
+            }
+            lag += 1
+        }
+        
+        // Voiced if normalized autocorrelation >= 0.65
+        if peakCount == 0 || globalMaxR < 0.65 {
+            return PitchResult(f0: 0.0, hnr: 0.0, isVoiced: false)
+        }
+        
+        // Pick the smallest lag whose peak is >= 80% of the maximum (suppresses octave errors)
+        var bestLag = -1
+        var bestNormR: Float = 0.0
+        let threshold = 0.8 * globalMaxR
+        
+        var pIdx = 0
+        while pIdx < peakCount {
+            let r = peaksR[pIdx]
+            if threshold <= r {
+                bestLag = peaksLag[pIdx]
+                bestNormR = r
+                break
+            }
+            pIdx += 1
+        }
+        
+        if bestLag == -1 {
+            return PitchResult(f0: 0.0, hnr: 0.0, isVoiced: false)
+        }
+        
+        let f0 = Float(config.sampleRate) / Float(bestLag)
+        var hnr: Float = 40.0
+        if bestNormR < 0.999 {
+            let noiseFrac = 1.0 - bestNormR
+            if 1e-5 <= noiseFrac {
+                let ratio = bestNormR / noiseFrac
+                if 1e-5 <= ratio {
+                    hnr = min(40.0, max(0.0, 10.0 * log10(ratio)))
+                }
+            }
+        }
+        
+        return PitchResult(f0: f0, hnr: hnr, isVoiced: true)
+    }
+}
