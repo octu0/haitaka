@@ -13,6 +13,7 @@ public final class MLXHawkTrainer: @unchecked Sendable {
 
     /// Compiled training steps keyed by padded sequence length (frames rounded up to a multiple of 32).
     private var compiledSteps: [Int: ([MLXArray]) -> [MLXArray]] = [:]
+    private var compiledClusterSteps: [Int: ([MLXArray]) -> [MLXArray]] = [:]
 
     /// MLX buffer cache limit. Each padded sequence length needs its own buffers, so the cache grows without
     /// bound; a limit below one step's working set forces reallocation every step and slows training.
@@ -33,6 +34,7 @@ public final class MLXHawkTrainer: @unchecked Sendable {
         network.importWeights(from: weights)
         optimizer.resetState()
         compiledSteps.removeAll()
+        compiledClusterSteps.removeAll()
         eval(network, optimizer)
     }
 
@@ -52,7 +54,6 @@ public final class MLXHawkTrainer: @unchecked Sendable {
         var validFeatures: [[[Float]]] = []
         var validTargets: [[Int]] = []
         var frameCounts: [Int] = []
-        var maxT = 0
         var b = 0
         while b < featuresBatch.count {
             let frames = featuresBatch[b].count
@@ -60,34 +61,13 @@ public final class MLXHawkTrainer: @unchecked Sendable {
                 validFeatures.append(featuresBatch[b])
                 validTargets.append(targetsBatch[b])
                 frameCounts.append(frames)
-                maxT = max(maxT, frames)
             }
             b += 1
         }
         if validFeatures.isEmpty {
             return 0.0
         }
-        // Round T up to a multiple of 32 to limit distinct compiled shapes; padded frames are masked by inputLengths.
-        maxT = ((maxT + 31) / 32) * 32
-        let count = validFeatures.count
-        let inDim = network.inputDim
-        var flat = [Float](repeating: 0.0, count: count * maxT * inDim)
-        b = 0
-        while b < count {
-            var t = 0
-            while t < validFeatures[b].count {
-                let offset = (b * maxT + t) * inDim
-                let row = validFeatures[b][t]
-                var d = 0
-                while d < inDim {
-                    flat[offset + d] = row[d]
-                    d += 1
-                }
-                t += 1
-            }
-            b += 1
-        }
-        let features = MLXArray(flat, [count, maxT, inDim])
+        let (features, maxT) = padded(validFeatures)
         let targets = MLXCTCLoss.ExtendedTargets(targetsBatch: validTargets, frameCounts: frameCounts, blankId: blankId)
 
         let lossFn = { (model: MLXHawkNetwork, arrays: [MLXArray]) -> [MLXArray] in
@@ -128,5 +108,107 @@ public final class MLXHawkTrainer: @unchecked Sendable {
         eval(network, optimizer, lossValues)
         lastGradientNorm = lossValues[1].item(Float.self)
         return lossValues[0].item(Float.self)
+    }
+
+    /// Runs one HuBERT-style step: spans of input frames are zeroed and the network predicts the cluster class of
+    /// each hidden frame. Classes come from the unmasked features, or from layer `teacherLayers` of `teacher`
+    /// for the second iteration. Returns the cross-entropy over masked frames.
+    public func trainBatchMaskedCluster(
+        featuresBatch: [[[Float]]],
+        codebook: [MLXArray],
+        maskStartProbability: Double,
+        maskSpan: Int,
+        teacher: MLXHawkNetwork? = nil,
+        teacherLayers: Int = 0
+    ) -> Float {
+        let valid = featuresBatch.filter { $0.isEmpty != true }
+        if valid.isEmpty {
+            return 0.0
+        }
+        let (features, maxT) = padded(valid)
+        var frameCounts: [Int32] = []
+        var span = [Float](repeating: 0.0, count: valid.count * maxT)
+        var b = 0
+        while b < valid.count {
+            let frames = valid[b].count
+            frameCounts.append(Int32(frames))
+            var t = 0
+            while t < frames {
+                if Double.random(in: 0.0..<1.0) < maskStartProbability {
+                    var k = 0
+                    while k < maskSpan && (t + k) < frames {
+                        span[b * maxT + t + k] = 1.0
+                        k += 1
+                    }
+                }
+                t += 1
+            }
+            b += 1
+        }
+        let counts = MLXArray(frameCounts)
+        let spanMask = MLXArray(span, [valid.count, maxT])
+        var source = features
+        if let teacher = teacher {
+            source = teacher.hidden(features, frameCounts: counts, layerCount: teacherLayers)
+        }
+        let targets = ClusterCodebook.assign(features: source, codebook: codebook)
+        eval(targets)
+
+        let lossFn = { (model: MLXHawkNetwork, arrays: [MLXArray]) -> [MLXArray] in
+            let mask = arrays[1]
+            let logits = model(arrays[0] * (1.0 - mask).expandedDimensions(axis: -1), frameCounts: arrays[3])
+            let picked = takeAlong(logSoftmax(logits, axis: -1), arrays[2].expandedDimensions(axis: -1), axis: -1).squeezed(axis: -1)
+            return [-sum(picked * mask) / maximum(sum(mask), MLXArray(Float(1.0)))]
+        }
+        let lg = valueAndGrad(model: network, lossFn)
+        func step(arrays: [MLXArray]) -> [MLXArray] {
+            let (lossValues, grads) = lg(self.network, Array(arrays[0..<4]))
+            let (clipped, norm) = clipGradNorm(gradients: grads, maxNorm: 5.0)
+            let outer = self.optimizer.learningRate
+            self.optimizer.learningRate = arrays[4]
+            self.optimizer.update(model: self.network, gradients: clipped)
+            self.optimizer.learningRate = outer
+            return lossValues + [norm]
+        }
+        var stepFn: ([MLXArray]) -> [MLXArray] = step
+        switch compiledClusterSteps[maxT] {
+        case .some(let cached):
+            stepFn = cached
+        case .none:
+            let fn = compile(inputs: [network, optimizer], outputs: [network, optimizer], step)
+            compiledClusterSteps[maxT] = fn
+            stepFn = fn
+        }
+        let lossValues = stepFn([features, spanMask, targets, counts, optimizer.learningRate])
+        eval(network, optimizer, lossValues)
+        lastGradientNorm = lossValues[1].item(Float.self)
+        return lossValues[0].item(Float.self)
+    }
+
+    /// Stacks sequences into [B, T, inputDim], zero-padding T up to a multiple of 32 to limit distinct compiled shapes.
+    private func padded(_ batch: [[[Float]]]) -> (MLXArray, Int) {
+        var maxT = 0
+        for f in batch {
+            maxT = max(maxT, f.count)
+        }
+        maxT = ((maxT + 31) / 32) * 32
+        let inDim = network.inputDim
+        var flat = [Float](repeating: 0.0, count: batch.count * maxT * inDim)
+        var b = 0
+        while b < batch.count {
+            var t = 0
+            while t < batch[b].count {
+                let offset = (b * maxT + t) * inDim
+                let row = batch[b][t]
+                var d = 0
+                while d < inDim {
+                    flat[offset + d] = row[d]
+                    d += 1
+                }
+                t += 1
+            }
+            b += 1
+        }
+        return (MLXArray(flat, [batch.count, maxT, inDim]), maxT)
     }
 }

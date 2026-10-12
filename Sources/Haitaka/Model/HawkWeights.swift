@@ -1,5 +1,18 @@
 import Foundation
 
+/// Default model shape (9.1M parameters), shared by training and pretraining.
+public enum HawkShape {
+    public static let numLayers = 8
+    public static let modelDim = 288
+    public static let rnnDim = 384
+    public static let mlpDim = 864
+    /// Number of diagonal blocks in the RG-LRU gates.
+    public static let heads = 8
+    public static let convWidth = 4
+    /// Future frames per layer. Total delay is numLayers × convRight frames of 40 ms.
+    public static let convRight = 2
+}
+
 /// Weights of the Hawk acoustic model (the recurrent-only variant of Griffin, De et al. 2024).
 /// Each layer is RMSNorm → recurrent block → residual, then RMSNorm → gated MLP → residual.
 /// The recurrent block multiplies a GeLU branch with a linear → causal conv → RG-LRU branch, then projects back.

@@ -13,17 +13,6 @@ print("==================================================")
 
 /// Training and evaluation defaults. Edit these values directly instead of adding command-line options.
 enum Defaults {
-    static let numLayers = 8
-    static let modelDim = 288
-    static let rnnDim = 384
-    static let mlpDim = 864
-    /// Number of diagonal blocks in the RG-LRU gates.
-    static let heads = 8
-    static let convWidth = 4
-    /// Future frames per layer. Total delay is numLayers × convRight frames of 40 ms.
-    static let convRight = 2
-
-
     /// Longest utterance used for training (40 ms frames, 60 s).
     static let maxTrainFrames = 1500
 
@@ -278,6 +267,17 @@ if let impPath = importWeightsPath {
     }
     importedWeights = weights
 }
+// Weights from pretrain carry no kana vocabulary; their layers start CTC training with a fresh readout.
+var pretrainedWeights: HawkWeights? = nil
+if let weights = importedWeights, weights.vocabulary == nil {
+    if epochs == 0 {
+        print("error: pretrained weights have no kana readout to evaluate")
+        exit(1)
+    }
+    pretrainedWeights = weights
+    importedWeights = nil
+    print("pretrained layers: \(importWeightsPath ?? "")")
+}
 // Imported weights carry their own kana vocabulary so output IDs stay stable across manifests.
 let kanaVocabulary: TextVocabulary
 switch importedWeights?.vocabulary {
@@ -338,19 +338,19 @@ for i in 0..<min(3, dataset.count) {
 
 print("\n--- 2. Training the acoustic model ---")
 let inputDim = StreamingFeatureFrontEnd.inputDim
-print("Hawk: input \(inputDim), layers \(Defaults.numLayers), width \(Defaults.modelDim), RNN width \(Defaults.rnnDim), MLP width \(Defaults.mlpDim), gate blocks \(Defaults.heads), conv \(Defaults.convWidth) frames, lookahead \(Defaults.convRight) frames/layer")
+print("Hawk: input \(inputDim), layers \(HawkShape.numLayers), width \(HawkShape.modelDim), RNN width \(HawkShape.rnnDim), MLP width \(HawkShape.mlpDim), gate blocks \(HawkShape.heads), conv \(HawkShape.convWidth) frames, lookahead \(HawkShape.convRight) frames/layer")
 
-if let weights = importedWeights {
-    guard weights.outputDim == kanaVocabulary.size,
+for weights in [importedWeights, pretrainedWeights].compactMap({ $0 }) {
+    guard weights.outputDim == kanaVocabulary.size || weights.vocabulary == nil,
           weights.inputDim == inputDim,
-          weights.numLayers == Defaults.numLayers,
-          weights.modelDim == Defaults.modelDim,
-          weights.rnnDim == Defaults.rnnDim,
-          weights.mlpDim == Defaults.mlpDim,
-          weights.heads == Defaults.heads,
-          weights.convWidth == Defaults.convWidth,
-          weights.convRight == Defaults.convRight || epochs == 0 else {
-        print("error: weights do not match Defaults (input \(weights.inputDim)/\(inputDim), output \(weights.outputDim)/\(kanaVocabulary.size), layers \(weights.numLayers)/\(Defaults.numLayers), width \(weights.modelDim)/\(Defaults.modelDim), lookahead \(weights.convRight)/\(Defaults.convRight))")
+          weights.numLayers == HawkShape.numLayers,
+          weights.modelDim == HawkShape.modelDim,
+          weights.rnnDim == HawkShape.rnnDim,
+          weights.mlpDim == HawkShape.mlpDim,
+          weights.heads == HawkShape.heads,
+          weights.convWidth == HawkShape.convWidth,
+          weights.convRight == HawkShape.convRight || epochs == 0 else {
+        print("error: weights do not match Defaults (input \(weights.inputDim)/\(inputDim), output \(weights.outputDim)/\(kanaVocabulary.size), layers \(weights.numLayers)/\(HawkShape.numLayers), width \(weights.modelDim)/\(HawkShape.modelDim), lookahead \(weights.convRight)/\(HawkShape.convRight))")
         exit(1)
     }
 }
@@ -360,19 +360,12 @@ var network: HawkNetwork? = importedWeights.map { HawkNetwork(weights: $0) }
 if 0 < epochs {
     let allTargets: [[Int]] = (0..<dataset.count).map { kanaVocabulary.textToIds(dataset.hiraganaText(at: $0)) }
 
-    let mlxNetwork = MLXHawkNetwork(
-        inputDim: inputDim,
-        modelDim: Defaults.modelDim,
-        rnnDim: Defaults.rnnDim,
-        mlpDim: Defaults.mlpDim,
-        heads: Defaults.heads,
-        convWidth: Defaults.convWidth,
-        convRight: Defaults.convRight,
-        numLayers: Defaults.numLayers,
-        outputDim: kanaVocabulary.size
-    )
+    let mlxNetwork = MLXHawkNetwork(outputDim: kanaVocabulary.size)
     if let weights = importedWeights {
         mlxNetwork.importWeights(from: weights)
+    }
+    if let weights = pretrainedWeights {
+        mlxNetwork.importEncoder(from: weights)
     }
     print("  parameters \(mlxNetwork.exportWeights().parameterCount), batch \(batchSize)")
     let trainer = MLXHawkTrainer(network: mlxNetwork, learningRate: Defaults.lrMax)

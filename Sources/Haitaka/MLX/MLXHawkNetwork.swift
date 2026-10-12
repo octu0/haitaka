@@ -247,6 +247,21 @@ public final class MLXHawkNetwork: Module, @unchecked Sendable {
         super.init()
     }
 
+    /// Network with the default shape (`HawkShape`) on the standard feature input.
+    public convenience init(outputDim: Int) {
+        self.init(
+            inputDim: StreamingFeatureFrontEnd.inputDim,
+            modelDim: HawkShape.modelDim,
+            rnnDim: HawkShape.rnnDim,
+            mlpDim: HawkShape.mlpDim,
+            heads: HawkShape.heads,
+            convWidth: HawkShape.convWidth,
+            convRight: HawkShape.convRight,
+            numLayers: HawkShape.numLayers,
+            outputDim: outputDim
+        )
+    }
+
     public convenience init(weights: HawkWeights) {
         self.init(
             inputDim: weights.inputDim,
@@ -269,21 +284,39 @@ public final class MLXHawkNetwork: Module, @unchecked Sendable {
     /// features: [B, T, inputDim] → logits [B, T, outputDim]. With `frameCounts` [B], frames past each sequence
     /// end are zeroed at the convolution input, matching CPU inference with lookahead.
     public func callAsFunction(_ features: MLXArray, frameCounts: MLXArray? = nil) -> MLXArray {
+        let x = hidden(features, frameCounts: frameCounts, layerCount: layers.count)
+        return matmul(hawkRMSNorm(x, finalNorm), wOut) + bOut
+    }
+
+    /// Residual stream [B, T, modelDim] after the first `layerCount` layers.
+    public func hidden(_ features: MLXArray, frameCounts: MLXArray? = nil, layerCount: Int) -> MLXArray {
         var x = matmul(features, wIn) + bIn
         var frameMask: MLXArray? = nil
         if let counts = frameCounts, 0 < convRight {
             let positions = MLXArray(0..<features.shape[1]).reshaped([1, features.shape[1], 1])
             frameMask = (positions .< counts.reshaped([-1, 1, 1])).asType(.float32)
         }
-        for layer in layers {
-            x = layer(x, frameMask: frameMask)
+        var l = 0
+        while l < layerCount {
+            x = layers[l](x, frameMask: frameMask)
+            l += 1
         }
-        return matmul(hawkRMSNorm(x, finalNorm), wOut) + bOut
+        return x
     }
 
     /// Loads weights through `update(parameters:)` rather than reassigning properties, so the module tree
     /// (and anything compiled against it) keeps the same parameter slots.
     public func importWeights(from w: HawkWeights) {
+        load(w, readout: true)
+    }
+
+    /// Loads everything except the readout, which keeps its current values. Used to start CTC training
+    /// from pretrained weights whose readout predicts cluster classes instead of kana.
+    public func importEncoder(from w: HawkWeights) {
+        load(w, readout: false)
+    }
+
+    private func load(_ w: HawkWeights, readout: Bool) {
         let d = w.modelDim
         let r = w.rnnDim
         let m = w.mlpDim
@@ -291,10 +324,12 @@ public final class MLXHawkNetwork: Module, @unchecked Sendable {
         var items: [(String, MLXArray)] = [
             ("wIn", MLXArray(w.wIn, [w.inputDim, d])),
             ("bIn", MLXArray(w.bIn, [d])),
-            ("finalNorm", MLXArray(w.finalNorm, [d])),
-            ("wOut", MLXArray(w.wOut, [d, w.outputDim])),
-            ("bOut", MLXArray(w.bOut, [w.outputDim]))
+            ("finalNorm", MLXArray(w.finalNorm, [d]))
         ]
+        if readout {
+            items.append(("wOut", MLXArray(w.wOut, [d, w.outputDim])))
+            items.append(("bOut", MLXArray(w.bOut, [w.outputDim])))
+        }
         var l = 0
         while l < min(layers.count, w.layers.count) {
             let lw = w.layers[l]

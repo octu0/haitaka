@@ -13,6 +13,7 @@ let package = Package(
         .executable(name: "mictrans", targets: ["mictrans"]),
         .executable(name: "stage2", targets: ["stage2"]),
         .executable(name: "kanalm", targets: ["kanalm"]),
+        .executable(name: "pretrain", targets: ["pretrain"]),
         .executable(name: "screen", targets: ["screen"]),
         .executable(name: "segment", targets: ["segment"]),
         .executable(name: "benchmark", targets: ["benchmark"])
@@ -35,6 +36,11 @@ let package = Package(
             dependencies: ["Haitaka", .product(name: "MLX", package: "mlx-swift")],
             path: "script/train",
             exclude: ["run.sh"]
+        ),
+        .executableTarget(
+            name: "pretrain",
+            dependencies: ["Haitaka", .product(name: "MLX", package: "mlx-swift")],
+            path: "script/pretrain"
         ),
         .executableTarget(name: "transcribe", dependencies: ["Haitaka"], path: "script/transcribe"),
         .executableTarget(name: "mictrans", dependencies: ["Haitaka"], path: "Sources/mictrans"),
