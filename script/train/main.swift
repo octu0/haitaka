@@ -29,6 +29,8 @@ enum Defaults {
 
     static let checkpointEvery = 10
     static let batchSize = 64
+    /// Seeds weight initialization, batch order and augmentation, so two runs differ only by their data.
+    static let seed: UInt64 = 1
     /// Batches within this window are reordered so equal padded lengths run back to back; compiled steps
     /// reallocate GPU buffers whenever the shape changes.
     static let bucketRunWindow = 64
@@ -360,6 +362,7 @@ var network: HawkNetwork? = importedWeights.map { HawkNetwork(weights: $0) }
 if 0 < epochs {
     let allTargets: [[Int]] = (0..<dataset.count).map { kanaVocabulary.textToIds(dataset.hiraganaText(at: $0)) }
 
+    MLXRandom.seed(Defaults.seed)
     let mlxNetwork = MLXHawkNetwork(outputDim: kanaVocabulary.size)
     if let weights = importedWeights {
         mlxNetwork.importWeights(from: weights)
@@ -369,8 +372,12 @@ if 0 < epochs {
     }
     print("  parameters \(mlxNetwork.exportWeights().parameterCount), batch \(batchSize)")
     let trainer = MLXHawkTrainer(network: mlxNetwork, learningRate: Defaults.lrMax)
-    let scheduler = CosineLRScheduler(lrMax: Defaults.lrMax, lrMin: Defaults.lrMin)
-    print("  learning rate: \(Defaults.lrMax) -> \(Defaults.lrMin)")
+    var scheduler = CosineLRScheduler(lrMax: Defaults.lrMax, lrMin: Defaults.lrMin)
+    // Fine-tuning from trained weights anneals from lrMin to zero over the whole run, without warmup.
+    if importedWeights != nil {
+        scheduler = CosineLRScheduler(lrMax: Defaults.lrMin, lrMin: 0.0)
+    }
+    print("  learning rate: \(scheduler.lrMax) -> \(scheduler.lrMin)")
     let trainStartTime = CFAbsoluteTimeGetCurrent()
 
     // CTC needs at least one frame per label plus one per repeated pair.
@@ -471,8 +478,12 @@ if 0 < epochs {
     }
 
     let totalSteps = max(1, epochs * batchGroups.count)
-    let warmupSteps = min(max(Defaults.minWarmupSteps, totalSteps / Defaults.warmupStepDivisor), max(1, totalSteps / 2))
-    let decaySteps = min(totalSteps - warmupSteps, Defaults.lrDecaySteps)
+    var warmupSteps = min(max(Defaults.minWarmupSteps, totalSteps / Defaults.warmupStepDivisor), max(1, totalSteps / 2))
+    var decaySteps = min(totalSteps - warmupSteps, Defaults.lrDecaySteps)
+    if importedWeights != nil {
+        warmupSteps = 0
+        decaySteps = totalSteps
+    }
     let scheduleSteps = warmupSteps + decaySteps
     print("  training steps: \(totalSteps) (warmup \(warmupSteps), decay \(decaySteps), then lrMin)")
 
@@ -488,15 +499,12 @@ if 0 < epochs {
     var rollbacks = 0
 
     var globalStep = 0
-    // Fine-tuning from trained weights skips warmup and decay and stays at lrMin.
-    if importedWeights != nil {
-        globalStep = scheduleSteps
-        print("  resuming from trained weights: constant learning rate lrMin \(Defaults.lrMin)")
-    }
+    var batchOrder = SplitMix64(seed: Defaults.seed)
     var ep = 1
     while ep <= epochs {
         let epStartTime = CFAbsoluteTimeGetCurrent()
-        batchGroups.shuffle()
+        augmenter.epochSalt = UInt64(ep)
+        batchGroups.shuffle(using: &batchOrder)
         groupBucketsWithinWindows(&batchGroups, window: Defaults.bucketRunWindow)
         var curLR = scheduler.learningRate(step: globalStep + 1, totalSteps: scheduleSteps, warmupSteps: warmupSteps) * lrScale
 

@@ -122,15 +122,15 @@ public struct ClusterCodebook: Codable, Sendable {
     }
 }
 
-/// Seeded generator for reproducible k-means initialization.
-struct SplitMix64: RandomNumberGenerator {
+/// Seeded generator for reproducible training: k-means initialization, batch order and augmentation.
+public struct SplitMix64: RandomNumberGenerator {
     var state: UInt64
 
-    init(seed: UInt64) {
+    public init(seed: UInt64) {
         self.state = seed
     }
 
-    mutating func next() -> UInt64 {
+    public mutating func next() -> UInt64 {
         state &+= 0x9E3779B97F4A7C15
         var z = state
         z = (z ^ (z >> 30)) &* 0xBF58476D1CE4E5B9

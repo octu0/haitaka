@@ -18,6 +18,9 @@ public final class FeatureAugmenter: @unchecked Sendable {
     public let speed: Bool
     public let specAugment: Bool
     public let noiseBank: NoiseBank?
+    /// Random choices are seeded by the utterance path and this value, so a run is reproducible while the
+    /// training loop still gives every utterance a different augmentation each epoch by changing the salt.
+    public var epochSalt: UInt64 = 0
 
     public init(speed: Bool, specAugment: Bool, noiseBank: NoiseBank? = nil) {
         self.speed = speed
@@ -25,26 +28,36 @@ public final class FeatureAugmenter: @unchecked Sendable {
         self.noiseBank = noiseBank
     }
 
+    /// FNV-1a hash of the path: the per-utterance part of the augmentation seed.
+    public static func seed(forPath path: String) -> UInt64 {
+        var h: UInt64 = 0xCBF29CE484222325
+        for byte in path.utf8 {
+            h ^= UInt64(byte)
+            h = h &* 0x100000001B3
+        }
+        return h
+    }
+
     /// nil when no PCM augmentation is enabled, so callers can skip the hook.
-    public var pcmTransform: (([Float]) -> [Float])? {
+    public var pcmTransform: ((String, [Float]) -> [Float])? {
         if speed != true && noiseBank == nil {
             return nil
         }
-        return { pcm in self.transformPCM(pcm) }
+        return { path, pcm in self.transformPCM(path: path, pcm) }
     }
 
-    public var featureTransform: (([[Float]]) -> [[Float]])? {
+    public var featureTransform: ((String, [[Float]]) -> [[Float]])? {
         if specAugment != true {
             return nil
         }
-        return { features in
-            var rng = SystemRandomNumberGenerator()
+        return { path, features in
+            var rng = SplitMix64(seed: (Self.seed(forPath: path) ^ self.epochSalt) &+ 1)
             return Self.specAugment(features, using: &rng)
         }
     }
 
-    func transformPCM(_ pcm: [Float]) -> [Float] {
-        var rng = SystemRandomNumberGenerator()
+    func transformPCM(path: String, _ pcm: [Float]) -> [Float] {
+        var rng = SplitMix64(seed: Self.seed(forPath: path) ^ epochSalt)
         var out = pcm
         if speed {
             let factor = Float.random(in: Self.speedRange, using: &rng)

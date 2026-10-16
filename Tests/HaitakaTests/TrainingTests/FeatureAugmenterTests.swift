@@ -67,6 +67,23 @@ final class FeatureAugmenterTests: XCTestCase {
         XCTAssertLessThanOrEqual(maskedBands, FeatureAugmenter.frequencyMasks * FeatureAugmenter.maxFrequencyMaskBands)
     }
 
+    func testAugmentationIsSeededByPathAndEpoch() {
+        var pcm = [Float](repeating: 0.0, count: 16000)
+        var i = 0
+        while i < pcm.count {
+            pcm[i] = sin(Float(i) * 0.02)
+            i += 1
+        }
+        let augmenter = FeatureAugmenter(speed: true, specAugment: false)
+        let transform = augmenter.pcmTransform!
+        XCTAssertEqual(transform("a.wav", pcm), transform("a.wav", pcm))
+        XCTAssertNotEqual(transform("a.wav", pcm).count, transform("b.wav", pcm).count)
+        let first = transform("a.wav", pcm)
+        augmenter.epochSalt = 2
+        XCTAssertNotEqual(transform("a.wav", pcm).count, first.count)
+        XCTAssertNotEqual(FeatureAugmenter.seed(forPath: "a.wav"), FeatureAugmenter.seed(forPath: "b.wav"))
+    }
+
     func testDisabledAugmenterHasNoHooks() {
         let off = FeatureAugmenter(speed: false, specAugment: false)
         XCTAssertNil(off.pcmTransform)
