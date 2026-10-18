@@ -1,7 +1,7 @@
 import Foundation
 
 /// Characters treated as punctuation in kana-kanji conversion.
-let punctuationCharacters: Set<Character> = ["、", "。", "，", "．"]
+let punctuationCharacters: Set<Character> = ["、", "。", "，", "．", "？", "！"]
 
 /// Dictionary entry: a surface form with its reading.
 public struct KanaKanjiEntry: Sendable {

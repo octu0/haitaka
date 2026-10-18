@@ -4,8 +4,8 @@ import Foundation
 ///
 /// Offline: call `setGain` with the clip RMS, then push hops. Streaming: gain follows the
 /// running RMS since speech onset (future samples are not available). The Hamming window is
-/// `DSPWorkspace`'s default 1024-point table; rebuilding it with `frameSize` points would
-/// change the features relative to training.
+/// symmetric over the 320-sample frame (changed 2026-10-18; weights trained before that used the
+/// first 320 points of a 1024-point table and are not compatible).
 public final class StreamingFeatureFrontEnd: @unchecked Sendable {
     public static let melChannels = 64
     /// 64 smoothed mel + 64 deltas
@@ -63,7 +63,8 @@ public final class StreamingFeatureFrontEnd: @unchecked Sendable {
         self.workspace = DSPWorkspace(
             lpcOrder: dspConfig.lpcOrder,
             melChannels: Self.melChannels,
-            maxPitchLag: dspConfig.maxPitchLag
+            maxPitchLag: dspConfig.maxPitchLag,
+            frameSize: dspConfig.frameSize
         )
         self.prevMel = [Float](repeating: 0.0, count: Self.melChannels)
         self.currMel = [Float](repeating: 0.0, count: Self.melChannels)

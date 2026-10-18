@@ -35,7 +35,8 @@ public final class DSPWorkspace: @unchecked Sendable {
         lpcOrder: Int = 12,
         melChannels: Int = 64,
         maxPitchLag: Int = 320,
-        fftSize: Int = 512
+        fftSize: Int = 512,
+        frameSize: Int = 320
     ) {
         self.maxFrameSize = maxFrameSize
         self.lpcOrder = lpcOrder
@@ -64,9 +65,11 @@ public final class DSPWorkspace: @unchecked Sendable {
         self.melEnergies = [Float](repeating: 0.0, count: melChannels)
         self.featureBuffer = [Float](repeating: 0.0, count: melChannels)
         
-        let factor = (2.0 * Float.pi) / Float(maxFrameSize - 1)
+        // Symmetric Hamming window over the analysis frame; entries past `frameSize` stay zero. The table used to span
+        // `maxFrameSize` points, which left the frame with a one-sided ramp and a step at its end.
+        let factor = (2.0 * Float.pi) / Float(frameSize - 1)
         var i = 0
-        while i < maxFrameSize {
+        while i < frameSize {
             self.hammingWindow[i] = 0.54 - (0.46 * cos(Float(i) * factor))
             i += 1
         }

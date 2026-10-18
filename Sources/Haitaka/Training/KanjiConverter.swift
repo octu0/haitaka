@@ -356,8 +356,8 @@ public struct KanjiConverter: Sendable {
             return []
         }
 
-        // Normalize stretch marks (〜 etc.) and remove unspoken laugh annotations.
-        let cleanText = Self.removeLaughAnnotations(Self.normalizeProlongedMarks(text))
+        // Normalize stretch marks (〜 etc.), remove unspoken laugh annotations, and spell out 「痛ーい」-style stretches.
+        let cleanText = stretchedOkurigana(Self.removeLaughAnnotations(Self.normalizeProlongedMarks(text)))
 
         let loc = Locale(identifier: "ja_JP") as CFLocale
         let nsText = cleanText as NSString
@@ -412,12 +412,34 @@ public struct KanjiConverter: Sendable {
             mergedSpans.append(currentSpan)
         }
 
+        // The tokenizer skips punctuation, so the marks are picked up from the gaps between tokens.
+        func appendPunctuation(from start: CFIndex, to end: CFIndex) {
+            if end <= start {
+                return
+            }
+            for mark in kanaOnly(nsText.substring(with: NSRange(location: start, length: end - start))) {
+                if Self.punctuation.contains(mark) {
+                    tokens.append(Token(surface: String(mark), reading: String(mark)))
+                }
+            }
+        }
+
         var tokens: [Token] = []
+        var consumedEnd: CFIndex = 0
         var mIdx = 0
         while mIdx < mergedSpans.count {
             let span = mergedSpans[mIdx]
             mIdx += 1
+            appendPunctuation(from: consumedEnd, to: span.range.location)
+            consumedEnd = span.range.location + span.range.length
             let surface = span.surface
+
+            // Punctuation tokens read as themselves; the tokenizer's Latin transcription would drop them.
+            let marks = kanaOnly(surface)
+            if marks.isEmpty != true && marks.allSatisfy({ Self.punctuation.contains($0) }) {
+                tokens.append(Token(surface: surface, reading: marks))
+                continue
+            }
 
             // Numbers get a place-value kana reading generated directly.
             if let numReading = Self.numberReading(surface) {
@@ -447,6 +469,7 @@ public struct KanjiConverter: Sendable {
             tokens.append(Token(surface: surface, reading: kanaOnly(Self.pronunciation(surface: surface, reading: reading))))
         }
 
+        appendPunctuation(from: consumedEnd, to: nsText.length)
         return Self.applyReadingOverrides(tokens)
     }
 
@@ -903,10 +926,13 @@ public struct KanjiConverter: Sendable {
         return String(result)
     }
 
-    /// Keeps only hiragana and the long-vowel mark.
-    ///
-    /// Punctuation is not audible, so it is excluded from the acoustic model's training targets;
-    /// stage 2 restores it from word-sequence statistics.
+    /// The punctuation marks kept in kana text: 、。？！. They mark pauses and intonation, so the acoustic
+    /// model learns them as targets and the kana n-gram LM learns where they go. Scoring strips them
+    /// again (`stripPunctuation` in train), so kana CER stays comparable.
+    public static let punctuation: Set<Character> = ["、", "。", "？", "！"]
+
+    /// Keeps hiragana, the long-vowel mark and the four punctuation marks; ASCII and full-width
+    /// variants of the marks are folded into 、。？！.
     public func kanaOnly(_ text: String) -> String {
         // Normalize to precomposed form, then select scalar by scalar. Checking by grapheme cluster
         // would let kana with combining marks (e.g. 「を」 + dakuten) through as one character and grow the vocabulary without bound.
@@ -918,6 +944,14 @@ public struct KanjiConverter: Sendable {
                 result.unicodeScalars.append(scalar)
             case _ where Self.isProlongedMark(val):
                 result.append("ー")
+            case 0x3001, 0xFF0C, 0x2C:
+                result.append("、")
+            case 0x3002, 0xFF0E, 0x2E:
+                result.append("。")
+            case 0xFF1F, 0x3F:
+                result.append("？")
+            case 0xFF01, 0x21:
+                result.append("！")
             default:
                 break
             }
@@ -925,7 +959,56 @@ public struct KanjiConverter: Sendable {
         return result
     }
 
-    /// Normalizes a morpheme reading to hiragana. Punctuation is removed by `kanaOnly`.
+    /// Collapses runs of punctuation to their first mark, drops a leading mark, and collapses runs of 「ー」
+    /// (「ありがとうー」 reads 「ありがとー」; CTC cannot emit a repeated 「ー」 without a blank between them anyway).
+    static func tidyKana(_ text: String) -> String {
+        var result = ""
+        var lastWasPunctuation = true
+        var lastWasLong = false
+        for c in text {
+            if punctuation.contains(c) {
+                if lastWasPunctuation != true {
+                    result.append(c)
+                }
+                lastWasPunctuation = true
+                lastWasLong = false
+            } else {
+                if c != "ー" || lastWasLong != true {
+                    result.append(c)
+                }
+                lastWasPunctuation = false
+                lastWasLong = c == "ー"
+            }
+        }
+        return result
+    }
+
+    /// Rewrites 「漢字ー送り仮名」 (痛ーい, 凄ーい) as kana with the stretch after the stem (いたーい). Left as is, the
+    /// tokenizer reads the kanji alone (痛 → つう) and the result becomes 「つーーい」.
+    func stretchedOkurigana(_ text: String) -> String {
+        guard text.contains("ー") else {
+            return text
+        }
+        let pattern = try? NSRegularExpression(pattern: "([\\p{Han}]+)ー([\\p{Hiragana}]+)")
+        guard let regex = pattern else {
+            return text
+        }
+        let ns = text as NSString
+        var result = text
+        for match in regex.matches(in: text, range: NSRange(location: 0, length: ns.length)).reversed() {
+            let kanji = ns.substring(with: match.range(at: 1))
+            let okurigana = ns.substring(with: match.range(at: 2))
+            let reading = convertToHiragana(kanji + okurigana)
+            var spelled = reading
+            if reading.hasSuffix(okurigana) {
+                spelled = String(reading.dropLast(okurigana.count)) + "ー" + okurigana
+            }
+            result = (result as NSString).replacingCharacters(in: match.range, with: spelled)
+        }
+        return result
+    }
+
+    /// Normalizes text to hiragana with punctuation (see `kanaOnly`).
     public func convertToHiragana(_ text: String) -> String {
         if text.isEmpty {
             return ""
@@ -936,7 +1019,7 @@ public struct KanjiConverter: Sendable {
             rawHira.append(token.reading)
         }
 
-        return kanaOnly(rawHira)
+        return Self.tidyKana(kanaOnly(rawHira))
     }
 
     /// Converts katakana to hiragana.

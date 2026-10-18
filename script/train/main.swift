@@ -646,7 +646,7 @@ print("==================================================")
     var out = ""
     for c in text {
         switch c {
-        case "、", "。", "，", "．", "・":
+        case "、", "。", "，", "．", "・", "？", "！", "?", "!":
             break
         default:
             out.append(c)
@@ -804,6 +804,9 @@ DispatchQueue.concurrentPerform(iterations: evalWorkers) { worker in
         let goldKanji = kanjiDecoder.decode(kanaText: targetKana)
         let targetNoPunct = stripPunctuation(pair.text)
         let goldNoPunct = stripPunctuation(goldKanji)
+        // Kana CER is scored without punctuation so it stays comparable with models that never emit it.
+        let targetKanaScored = stripPunctuation(targetKana)
+        let kanaScored = stripPunctuation(kana)
 
         var corpusDir = ((pair.path as NSString).deletingLastPathComponent as NSString).lastPathComponent
         if corpusDir == "wav" {
@@ -820,7 +823,7 @@ DispatchQueue.concurrentPerform(iterations: evalWorkers) { worker in
             isTrain: evalIsTrain[idx],
             targetKana: targetKana,
             predKana: kana,
-            kanaCer: Float(levenshteinDistance(targetKana, kana)) / Float(max(1, targetKana.count)),
+            kanaCer: Float(levenshteinDistance(targetKanaScored, kanaScored)) / Float(max(1, targetKanaScored.count)),
             goldKanji: goldKanji,
             goldKanjiCer: Float(levenshteinDistance(pair.text, goldKanji)) / textLength,
             goldKanjiCerNoPunct: Float(levenshteinDistance(targetNoPunct, goldNoPunct)) / Float(max(1, targetNoPunct.count)),

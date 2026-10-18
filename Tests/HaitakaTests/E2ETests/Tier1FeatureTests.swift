@@ -706,10 +706,14 @@ final class Tier1FeatureTests: XCTestCase {
     }
 
     func testDSPWorkspaceHammingWindowPrecomputation() {
+        // The window is symmetric over the 320-sample analysis frame; the rest of the table stays zero.
         let workspace = DSPWorkspace(maxFrameSize: 512, lpcOrder: 12, melChannels: 24)
         XCTAssertLessThanOrEqual(workspace.hammingWindow[0], 0.15)
-        XCTAssertLessThanOrEqual(workspace.hammingWindow[511], 0.15)
-        XCTAssertLessThanOrEqual(0.95, workspace.hammingWindow[256])
+        XCTAssertLessThanOrEqual(workspace.hammingWindow[319], 0.15)
+        XCTAssertLessThanOrEqual(0.95, workspace.hammingWindow[160])
+        XCTAssertEqual(workspace.hammingWindow[10], workspace.hammingWindow[309], accuracy: 1e-5)
+        XCTAssertEqual(workspace.hammingWindow[320], 0.0)
+        XCTAssertEqual(workspace.hammingWindow[511], 0.0)
     }
 
     func testDSPWorkspaceMemoryReuseHotPath() {

@@ -153,9 +153,15 @@ func splitSentences(_ text: String, atLeast minimum: Int) -> [String] {
     return sentences
 }
 
-/// Length in kana, excluding symbols and whitespace, used for density.
+/// Length in kana, excluding punctuation, symbols and whitespace, used for density.
 func speechLength(_ s: String) -> Int {
-    return converter.kanaOnly(converter.convertToHiragana(s)).count
+    var count = 0
+    for c in converter.convertToHiragana(s) {
+        if KanjiConverter.punctuation.contains(c) != true {
+            count += 1
+        }
+    }
+    return count
 }
 
 /// Assigns sentences to spans in order. With more spans than sentences, short spans are merged with neighbors.

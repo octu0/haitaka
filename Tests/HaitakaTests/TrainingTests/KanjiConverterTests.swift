@@ -75,16 +75,16 @@ final class KanjiConverterTests: XCTestCase {
     func testWaveDashAndProlongedNormalization() {
         let converter = KanjiConverter()
 
-        // Wave dash 〜 and full-width tilde ～ become ー.
+        // Wave dash 〜 and full-width tilde ～ become ー; runs collapse to one.
         XCTAssertEqual(converter.convertToHiragana("ら〜めん"), "らーめん")
         XCTAssertEqual(converter.convertToHiragana("ら～めん"), "らーめん")
         XCTAssertEqual(converter.convertToHiragana("う〜ん"), "うーん")
-        XCTAssertEqual(converter.convertToHiragana("あ〜〜"), "あーー")
+        XCTAssertEqual(converter.convertToHiragana("あ〜〜"), "あー")
 
         // Half-width ｰ (U+FF70), horizontal bar ― (U+2015), and em dash — (U+2014) become ー.
         XCTAssertEqual(converter.convertToHiragana("らｰめん"), "らーめん")
-        XCTAssertEqual(converter.convertToHiragana("あ――"), "あーー")
-        XCTAssertEqual(converter.convertToHiragana("え——"), "えーー")
+        XCTAssertEqual(converter.convertToHiragana("あ――"), "あー")
+        XCTAssertEqual(converter.convertToHiragana("え——"), "えー")
 
         // normalizeKana and kanaOnly normalize the same way.
         XCTAssertEqual(converter.normalizeKana("ら〜めん"), "らーめん")
@@ -181,8 +181,8 @@ final class KanjiConverterTests: XCTestCase {
         XCTAssertEqual(converter.convertToHiragana(""), "")
 
         // Wave dashes and prolonged marks only.
-        XCTAssertEqual(converter.convertToHiragana("〜〜〜"), "ーーー")
-        XCTAssertEqual(converter.convertToHiragana("あ〜〜〜〜"), "あーーーー")
+        XCTAssertEqual(converter.convertToHiragana("〜〜〜"), "ー")
+        XCTAssertEqual(converter.convertToHiragana("あ〜〜〜〜"), "あー")
 
         // Full-width Latin letters.
         let fullwidthTokens = converter.tokenize("ｉＰｈｏｎｅ")
@@ -247,7 +247,7 @@ final class KanjiConverterTests: XCTestCase {
         let converter = KanjiConverter()
         // Morphological analyzer readings are adjusted to spoken forms.
         XCTAssertEqual(converter.convertToHiragana("私は皆と日本へ行く"), "わたしわみんなとにほんえいく")
-        XCTAssertEqual(converter.convertToHiragana("皆さん、明日と一昨日"), "みなさんあしたとおととい")
+        XCTAssertEqual(converter.convertToHiragana("皆さん、明日と一昨日"), "みなさん、あしたとおととい")
         XCTAssertEqual(converter.convertToHiragana("そういうことだと言う"), "そーゆーことだとゆー")
         XCTAssertEqual(converter.convertToHiragana("言いました"), "いーました")
         // Compound words are merged.
@@ -272,7 +272,7 @@ final class KanjiConverterTests: XCTestCase {
         // Rendaku after a noun; unchanged after words ending in kana (この, 深い).
         XCTAssertEqual(converter.convertToHiragana("ビル作りと多摩川"), "びるずくりとたまがわ")
         XCTAssertEqual(converter.convertToHiragana("ゲーム好きと腕時計と十時頃"), "げーむずきとうでどけーとじゅーじごろ")
-        XCTAssertEqual(converter.convertToHiragana("この通り、深い川"), "このとーりふかいかわ")
+        XCTAssertEqual(converter.convertToHiragana("この通り、深い川"), "このとーり、ふかいかわ")
         XCTAssertEqual(converter.convertToHiragana("兄ちゃんと姉さん"), "にーちゃんとねーさん")
     }
 
@@ -300,10 +300,30 @@ final class KanjiConverterTests: XCTestCase {
         XCTAssertEqual(converter.convertToHiragana("位置確認"), "いちかくにん")
     }
 
+    func testPunctuationIsKeptAndNormalized() {
+        let converter = KanjiConverter()
+        // The four marks survive, variants fold into them, runs collapse, and a leading mark is dropped.
+        XCTAssertEqual(converter.convertToHiragana("はい。そう、そう！え?"), "はい。そー、そー！え？")
+        XCTAssertEqual(converter.convertToHiragana("うん,でも.ね!"), "うん、でも。ね！")
+        XCTAssertEqual(converter.convertToHiragana("。。え、、、ねえ。"), "え、ねー。")
+        XCTAssertEqual(converter.convertToHiragana("「起きてるんかい!」"), "おきてるんかい！")
+    }
+
+    func testStretchedOkuriganaAndLongVowelRuns() {
+        let converter = KanjiConverter()
+        // 「漢字ー送り仮名」 keeps the kun reading with the stretch after the stem.
+        XCTAssertEqual(converter.convertToHiragana("痛ーい"), "いたーい")
+        XCTAssertEqual(converter.convertToHiragana("凄ーい、高ーい"), "すごーい、たかーい")
+        XCTAssertEqual(converter.convertToHiragana("すごーい"), "すごーい")
+        // Runs of 「ー」 collapse to one.
+        XCTAssertEqual(converter.convertToHiragana("ありがとうー"), "ありがとー")
+        XCTAssertEqual(converter.convertToHiragana("あーーー、うん"), "あー、うん")
+    }
+
     func testTranscriptionMarkersAreSilent() {
         let converter = KanjiConverter()
         // (笑), (爆笑), and (冷笑) mark laughter and are not pronounced.
-        XCTAssertEqual(converter.convertToHiragana("(笑)ん?撮ってない?"), "んとってない")
+        XCTAssertEqual(converter.convertToHiragana("(笑)ん?撮ってない?"), "ん？とってない？")
         XCTAssertEqual(converter.convertToHiragana("やられた(爆笑)駆除した（冷笑）ね"), "やられたくじょしたね")
         // Parenthesized text without 笑 is kept.
         XCTAssertEqual(converter.convertToHiragana("彼(兄)が来た"), "かれあにがきた")
@@ -315,7 +335,7 @@ final class KanjiConverterTests: XCTestCase {
     func testEnglishWordsAndKimi() {
         let converter = KanjiConverter()
         // Unknown English words get an empty reading, even with punctuation; uppercase words of 5+ letters are not spelled out.
-        XCTAssertEqual(converter.convertToHiragana("Have a sweet dream.See you"), "えー")
+        XCTAssertEqual(converter.convertToHiragana("Have a sweet dream.See you"), "えー。")
         XCTAssertEqual(converter.convertToHiragana("Thank you.今日がね"), "きょーがね")
         XCTAssertEqual(converter.convertToHiragana("ZENSHOグループ"), "ぐるーぷ")
         XCTAssertEqual(converter.convertToHiragana("GPU"), "じーぴーゆー")
