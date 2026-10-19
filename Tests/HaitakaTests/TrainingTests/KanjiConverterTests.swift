@@ -309,6 +309,14 @@ final class KanjiConverterTests: XCTestCase {
         XCTAssertEqual(converter.convertToHiragana("「起きてるんかい!」"), "おきてるんかい！")
     }
 
+    func testKatakanaLoanwordsKeepEi() {
+        let converter = KanjiConverter()
+        // えい lengthens in native words but stays えい in katakana loanwords.
+        XCTAssertEqual(converter.convertToHiragana("映画と英語"), "えーがとえーご")
+        XCTAssertEqual(converter.convertToHiragana("メイン衣装とメイク"), "めいんいしょーとめいく")
+        XCTAssertEqual(converter.convertToHiragana("ベイビー、ケーキ"), "べいびー、けーき")
+    }
+
     func testStretchedOkuriganaAndLongVowelRuns() {
         let converter = KanjiConverter()
         // 「漢字ー送り仮名」 keeps the kun reading with the stretch after the stem.

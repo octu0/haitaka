@@ -191,7 +191,117 @@ public final class MLXHawkLayer: Module, @unchecked Sendable {
     }
 }
 
-/// Hawk acoustic model on MLX: input projection → layers → RMSNorm → readout.
+
+/// Rotary position embedding on the last axis (half-split pairs). x: [..., T, ..., headDim] with the time axis
+/// given by `cos`/`sin` shaped to broadcast ([T, 1, half] for [B, T, H, D], [T, half] for [B, T, D]).
+@inline(__always)
+func hawkRotary(_ x: MLXArray, cos c: MLXArray, sin s: MLXArray) -> MLXArray {
+    let half = x.shape[x.ndim - 1] / 2
+    let x1 = x[.ellipsis, 0..<half]
+    let x2 = x[.ellipsis, half..<(2 * half)]
+    return concatenated([x1 * c - x2 * s, x1 * s + x2 * c], axis: -1)
+}
+
+/// Griffin-style local attention block: multi-query attention over the last `window` frames (causal), then a
+/// gated MLP. See `HawkAttentionLayerWeights`.
+public final class MLXHawkAttentionLayer: Module, @unchecked Sendable {
+    public var norm1: MLXArray
+    public var wQ: MLXArray
+    public var wK: MLXArray
+    public var wV: MLXArray
+    public var wO: MLXArray
+    public var norm2: MLXArray
+    public var wMLPGate: MLXArray
+    public var wMLPUp: MLXArray
+    public var wMLPDown: MLXArray
+
+    let after: Int
+    let heads: Int
+    let window: Int
+
+    init(after: Int, modelDim: Int, mlpDim: Int, heads: Int, window: Int, residualScale: Float) {
+        self.after = after
+        self.heads = heads
+        self.window = window
+        let headDim = modelDim / heads
+        func uniform(_ fanIn: Int, _ shape: [Int], scale: Float = 1.0) -> MLXArray {
+            let bound = scale * sqrt(3.0 / Float(fanIn))
+            return MLXRandom.uniform(low: -bound, high: bound, shape)
+        }
+        self.norm1 = MLXArray.ones([modelDim])
+        self.wQ = uniform(modelDim, [modelDim, heads * headDim])
+        self.wK = uniform(modelDim, [modelDim, headDim])
+        self.wV = uniform(modelDim, [modelDim, headDim])
+        self.wO = uniform(heads * headDim, [heads * headDim, modelDim], scale: residualScale)
+        self.norm2 = MLXArray.ones([modelDim])
+        self.wMLPGate = uniform(modelDim, [modelDim, mlpDim])
+        self.wMLPUp = uniform(modelDim, [modelDim, mlpDim])
+        self.wMLPDown = uniform(mlpDim, [mlpDim, modelDim], scale: residualScale)
+        super.init()
+    }
+
+    /// x: [B, T, modelDim] → [B, T, modelDim]. Scores are built one look-back offset at a time, so memory grows
+    /// with T × window instead of T².
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let batch = x.shape[0]
+        let frames = x.shape[1]
+        let headDim = wK.shape[1]
+        let half = headDim / 2
+        var angles = [Float](repeating: 0.0, count: frames * half)
+        var t = 0
+        while t < frames {
+            var i = 0
+            while i < half {
+                angles[t * half + i] = HawkAttentionLayerWeights.rotaryAngle(position: t, pair: i, headDim: headDim)
+                i += 1
+            }
+            t += 1
+        }
+        let theta = MLXArray(angles, [frames, half])
+        let cosT = cos(theta)
+        let sinT = sin(theta)
+
+        let n = hawkRMSNorm(x, norm1)
+        let q = hawkRotary(matmul(n, wQ).reshaped([batch, frames, heads, headDim]),
+                           cos: cosT.reshaped([frames, 1, half]), sin: sinT.reshaped([frames, 1, half])) * (1.0 / sqrt(Float(headDim)))
+        let k = hawkRotary(matmul(n, wK), cos: cosT, sin: sinT)
+        let v = matmul(n, wV)
+        let span = min(window, frames)
+        var scores: [MLXArray] = []
+        var values: [MLXArray] = []
+        var offset = 0
+        while offset < span {
+            var kShift = k
+            var vShift = v
+            if 0 < offset {
+                let pad = MLXArray.zeros([batch, offset, headDim])
+                kShift = concatenated([pad, k[0..., 0..<(frames - offset), 0...]], axis: 1)
+                vShift = concatenated([pad, v[0..., 0..<(frames - offset), 0...]], axis: 1)
+            }
+            // [B, T, H]; frames before the sequence start are masked out.
+            var sc = sum(q * kShift.expandedDimensions(axis: 2), axis: -1)
+            if 0 < offset {
+                let positions = MLXArray(0..<frames).reshaped([1, frames, 1])
+                sc = MLX.where(positions .< offset, MLXArray(Float(-1e9)), sc)
+            }
+            scores.append(sc)
+            values.append(vShift)
+            offset += 1
+        }
+        let weights = softmax(stacked(scores, axis: -1), axis: -1)   // [B, T, H, span]
+        var out = MLXArray.zeros([batch, frames, heads, headDim])
+        offset = 0
+        while offset < span {
+            out = out + weights[.ellipsis, offset..<(offset + 1)] * values[offset].expandedDimensions(axis: 2)
+            offset += 1
+        }
+        let mixed = x + matmul(out.reshaped([batch, frames, heads * headDim]), wO)
+        let m = hawkRMSNorm(mixed, norm2)
+        return mixed + matmul(hawkGelu(matmul(m, wMLPGate)) * matmul(m, wMLPUp), wMLPDown)
+    }
+}
+
+/// Hawk acoustic model on MLX: input projection → layers (with optional local attention blocks) → RMSNorm → readout.
 public final class MLXHawkNetwork: Module, @unchecked Sendable {
     public let inputDim: Int
     public let modelDim: Int
@@ -201,10 +311,13 @@ public final class MLXHawkNetwork: Module, @unchecked Sendable {
     public let convWidth: Int
     public let convRight: Int
     public let outputDim: Int
+    public let attentionHeads: Int
+    public let attentionWindow: Int
 
     public var wIn: MLXArray
     public var bIn: MLXArray
     public var layers: [MLXHawkLayer]
+    public var attention: [MLXHawkAttentionLayer]
     public var finalNorm: MLXArray
     public var wOut: MLXArray
     public var bOut: MLXArray
@@ -218,9 +331,14 @@ public final class MLXHawkNetwork: Module, @unchecked Sendable {
         convWidth: Int,
         convRight: Int,
         numLayers: Int,
-        outputDim: Int
+        outputDim: Int,
+        attentionAfter: [Int] = [],
+        attentionHeads: Int = HawkShape.attentionHeads,
+        attentionWindow: Int = HawkShape.attentionWindow
     ) {
         self.inputDim = inputDim
+        self.attentionHeads = attentionAfter.isEmpty ? 0 : attentionHeads
+        self.attentionWindow = attentionAfter.isEmpty ? 0 : attentionWindow
         self.modelDim = modelDim
         self.rnnDim = rnnDim
         self.mlpDim = mlpDim
@@ -240,6 +358,10 @@ public final class MLXHawkNetwork: Module, @unchecked Sendable {
             l += 1
         }
         self.layers = built
+        let blockScale = 1.0 / sqrt(Float(2 * (numLayers + attentionAfter.count)))
+        self.attention = attentionAfter.sorted().map { after in
+            MLXHawkAttentionLayer(after: after, modelDim: modelDim, mlpDim: mlpDim, heads: attentionHeads, window: attentionWindow, residualScale: blockScale)
+        }
         self.finalNorm = MLXArray.ones([modelDim])
         let outBound = sqrt(3.0 / Float(modelDim))
         self.wOut = MLXRandom.uniform(low: -outBound, high: outBound, [modelDim, outputDim])
@@ -258,7 +380,8 @@ public final class MLXHawkNetwork: Module, @unchecked Sendable {
             convWidth: HawkShape.convWidth,
             convRight: HawkShape.convRight,
             numLayers: HawkShape.numLayers,
-            outputDim: outputDim
+            outputDim: outputDim,
+            attentionAfter: HawkShape.attentionAfter
         )
     }
 
@@ -272,7 +395,10 @@ public final class MLXHawkNetwork: Module, @unchecked Sendable {
             convWidth: weights.convWidth,
             convRight: weights.convRight,
             numLayers: weights.numLayers,
-            outputDim: weights.outputDim
+            outputDim: weights.outputDim,
+            attentionAfter: weights.attention.map { $0.after },
+            attentionHeads: max(1, weights.attentionHeads),
+            attentionWindow: max(1, weights.attentionWindow)
         )
         importWeights(from: weights)
     }
@@ -299,6 +425,9 @@ public final class MLXHawkNetwork: Module, @unchecked Sendable {
         var l = 0
         while l < layerCount {
             x = layers[l](x, frameMask: frameMask)
+            for block in attention where block.after == l {
+                x = block(x)
+            }
             l += 1
         }
         return x
@@ -351,6 +480,22 @@ public final class MLXHawkNetwork: Module, @unchecked Sendable {
             items.append((p + "wMLPDown", MLXArray(lw.wMLPDown, [m, d])))
             l += 1
         }
+        var b = 0
+        while b < min(attention.count, w.attention.count) {
+            let aw = w.attention[b]
+            let p = "attention.\(b)."
+            let hd = w.attentionHeadDim
+            items.append((p + "norm1", MLXArray(aw.norm1, [d])))
+            items.append((p + "wQ", MLXArray(aw.wQ, [d, w.attentionHeads * hd])))
+            items.append((p + "wK", MLXArray(aw.wK, [d, hd])))
+            items.append((p + "wV", MLXArray(aw.wV, [d, hd])))
+            items.append((p + "wO", MLXArray(aw.wO, [w.attentionHeads * hd, d])))
+            items.append((p + "norm2", MLXArray(aw.norm2, [d])))
+            items.append((p + "wMLPGate", MLXArray(aw.wMLPGate, [d, m])))
+            items.append((p + "wMLPUp", MLXArray(aw.wMLPUp, [d, m])))
+            items.append((p + "wMLPDown", MLXArray(aw.wMLPDown, [m, d])))
+            b += 1
+        }
         update(parameters: ModuleParameters.unflattened(items))
         eval(self)
     }
@@ -384,7 +529,16 @@ public final class MLXHawkNetwork: Module, @unchecked Sendable {
             finalNorm: values(finalNorm),
             wOut: values(wOut),
             bOut: values(bOut),
-            vocabularyCharacters: vocabulary?.serializedCharacters
+            vocabularyCharacters: vocabulary?.serializedCharacters,
+            attention: attention.map { a in
+                HawkAttentionLayerWeights(
+                    after: a.after, norm1: values(a.norm1), wQ: values(a.wQ), wK: values(a.wK), wV: values(a.wV),
+                    wO: values(a.wO), norm2: values(a.norm2), wMLPGate: values(a.wMLPGate), wMLPUp: values(a.wMLPUp),
+                    wMLPDown: values(a.wMLPDown)
+                )
+            },
+            attentionHeads: attentionHeads,
+            attentionWindow: attentionWindow
         )
     }
 }

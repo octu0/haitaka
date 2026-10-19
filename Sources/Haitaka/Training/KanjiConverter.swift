@@ -454,7 +454,12 @@ public struct KanjiConverter: Sendable {
             }
 
             var reading = ""
-            switch span.latinAttr {
+            // Katakana is already phonetic; the tokenizer's Latin transcription would turn エイ into ē.
+            var latinAttr = span.latinAttr
+            if Self.isKatakanaWord(surface) {
+                latinAttr = nil
+            }
+            switch latinAttr {
             case .some(let latin):
                 // Decompose (NFD) so macrons become the combining U+0304, then replace it with 「ー」 before CFStringTransform.
                 let decomposed = (latin as String).decomposedStringWithCanonicalMapping
@@ -648,6 +653,19 @@ public struct KanjiConverter: Sendable {
         default:
             return false
         }
+    }
+
+    /// True for a surface written in katakana (with ー allowed) and nothing else.
+    static func isKatakanaWord(_ surface: String) -> Bool {
+        if surface.isEmpty {
+            return false
+        }
+        for scalar in surface.unicodeScalars {
+            if isKatakana(scalar) != true && scalar.value != 0x30FC && isProlongedMark(scalar.value) != true {
+                return false
+            }
+        }
+        return true
     }
 
     static func isKatakana(_ scalar: Unicode.Scalar) -> Bool {
@@ -872,7 +890,8 @@ public struct KanjiConverter: Sendable {
     ///   - Particles 「は」, 「へ」 (standalone tokens) -> わ, え; 「を」 -> お
     ///   - ぢ, づ -> じ, ず
     ///   - The second kana of a same-vowel pair (おう, おお, えい, ええ, ああ, いい, うう) -> ー,
-    ///     except the final う of verbs in `uEndingVerbs` (思う, 追う, 食う).
+    ///     except the final う of verbs in `uEndingVerbs` (思う, 追う, 食う), and except えい inside
+    ///     katakana loanwords (メイン, メイク, ベイビー), where the い is pronounced.
     static func pronunciation(surface: String, reading: String) -> String {
         switch surface {
         case "は":
@@ -886,6 +905,7 @@ public struct KanjiConverter: Sendable {
         var result: [Character] = []
         result.reserveCapacity(chars.count)
         let keepsFinalU = Self.uEndingVerbs.contains(surface)
+        let loanword = Self.isKatakanaWord(surface)
         var i = 0
         while i < chars.count {
             var c = chars[i]
@@ -906,7 +926,7 @@ public struct KanjiConverter: Sendable {
                 case "う":
                     lengthens = (prevVowel == "お" || prevVowel == "う") && (isLast && keepsFinalU) != true
                 case "い":
-                    lengthens = (prevVowel == "え" || prevVowel == "い")
+                    lengthens = prevVowel == "い" || (prevVowel == "え" && loanword != true)
                 case "え":
                     lengthens = (prevVowel == "え")
                 case "お":

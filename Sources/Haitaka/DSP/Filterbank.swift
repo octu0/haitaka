@@ -1,6 +1,10 @@
 import Foundation
 
 public struct Filterbank: Sendable {
+    /// Experiment switch (10-19): HAITAKA_DSP_RANGE=1 widens the log-mel range to [-14, -2] and bypasses the
+    /// VAD-gated formant equalizer. Removed once the small-scale A/B picks a default.
+    static let wideRange: Bool = ProcessInfo.processInfo.environment["HAITAKA_DSP_RANGE"] == "1"
+
     public let config: DSPConfig
     private let fft: FFT
     private let vad: VAD
@@ -152,7 +156,7 @@ public struct Filterbank: Sendable {
         
         // Formant-adaptive spectral equalizer (VAD + LPC + Durand-Kerner)
         let vadRes = vad.processFrame(ptr: pcmPtr, count: winCount, workspace: workspace)
-        if vadRes.isSpeech {
+        if vadRes.isSpeech && Self.wideRange != true {
             let lpcSuccess = lpc.computeCoefficients(ptr: pcmPtr, count: winCount, workspace: workspace)
             var formantRes = FormantResult(f1: 0.0, f2: 0.0, f3: 0.0, b1: 0.0, b2: 0.0, b3: 0.0, count: 0)
             if lpcSuccess {
@@ -235,7 +239,10 @@ public struct Filterbank: Sendable {
         var ch = 0
         while ch < config.melChannels {
             let rawE = melEnergies[ch]
-            let normE = (rawE + 10.0) / 10.0
+            var normE = (rawE + 10.0) / 10.0
+            if Self.wideRange {
+                normE = (rawE + 14.0) / 12.0
+            }
             var c = normE
             if normE < 0.0 {
                 c = 0.0

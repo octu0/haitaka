@@ -20,11 +20,19 @@ public final class HawkNetwork: @unchecked Sendable {
         public var convBuffer: [[Float]]
         /// Per-layer residual stream for frames waiting on the convolution, [rows, modelDim].
         public var pending: [[Float]]
+        /// Per attention block, rotated keys and values of the last `attentionWindow - 1` frames, [rows, headDim].
+        public var attentionKeys: [[Float]]
+        public var attentionValues: [[Float]]
+        /// Per attention block, the absolute position of the next frame.
+        public var attentionPosition: [Int]
 
         init(weights: HawkWeights) {
             memory = [[Float]](repeating: [Float](repeating: 0.0, count: weights.rnnDim), count: weights.numLayers)
             convBuffer = [[Float]](repeating: [Float](repeating: 0.0, count: (weights.convWidth - 1) * weights.rnnDim), count: weights.numLayers)
             pending = [[Float]](repeating: [], count: weights.numLayers)
+            attentionKeys = [[Float]](repeating: [], count: weights.attention.count)
+            attentionValues = [[Float]](repeating: [], count: weights.attention.count)
+            attentionPosition = [Int](repeating: 0, count: weights.attention.count)
         }
     }
 
@@ -93,6 +101,7 @@ public final class HawkNetwork: @unchecked Sendable {
             ingest(layer: l, input: x, state: state)
             state.convBuffer[l] += [Float](repeating: 0.0, count: w.convRight * w.rnnDim)
             x = produce(layer: l, state: state)
+            x = attendAfter(layer: l, input: x, state: state)
             l += 1
         }
         return logSoftmaxRows(readout(x))
@@ -116,9 +125,140 @@ public final class HawkNetwork: @unchecked Sendable {
         while l < w.numLayers {
             ingest(layer: l, input: x, state: state)
             x = produce(layer: l, state: state)
+            x = attendAfter(layer: l, input: x, state: state)
             l += 1
         }
         return readout(x)
+    }
+
+    /// Runs the attention blocks that follow recurrent layer `l` on its output frames.
+    private func attendAfter(layer l: Int, input: [Float], state: State) -> [Float] {
+        var x = input
+        var b = 0
+        while b < weights.attention.count {
+            if weights.attention[b].after == l {
+                x = attend(block: b, input: x, state: state)
+            }
+            b += 1
+        }
+        return x
+    }
+
+    /// Causal multi-query attention over the last `attentionWindow` frames, then the gated MLP. [rows, modelDim].
+    private func attend(block b: Int, input: [Float], state: State) -> [Float] {
+        let w = weights
+        let d = w.modelDim
+        let m = w.mlpDim
+        let heads = w.attentionHeads
+        let hd = w.attentionHeadDim
+        let half = hd / 2
+        let rows = input.count / d
+        if rows <= 0 {
+            return input
+        }
+        let aw = w.attention[b]
+        var x = input
+        var normed = [Float](repeating: 0.0, count: rows * d)
+        Self.rmsNorm(x, aw.norm1, &normed, frames: rows, width: d)
+        var q = [Float](repeating: 0.0, count: rows * heads * hd)
+        var k = [Float](repeating: 0.0, count: rows * hd)
+        var v = [Float](repeating: 0.0, count: rows * hd)
+        Self.gemm(normed, aw.wQ, &q, m: rows, n: heads * hd, k: d)
+        Self.gemm(normed, aw.wK, &k, m: rows, n: hd, k: d)
+        Self.gemm(normed, aw.wV, &v, m: rows, n: hd, k: d)
+        let start = state.attentionPosition[b]
+        // Rotary positions; angles in Double so hours-long streams keep their relative phases.
+        func rotate(_ buf: inout [Float], base: Int, position: Int) {
+            var i = 0
+            while i < half {
+                let angle = Double(position) * pow(10000.0, -2.0 * Double(i) / Double(hd))
+                let c = Float(cos(angle))
+                let s = Float(sin(angle))
+                let x1 = buf[base + i]
+                let x2 = buf[base + half + i]
+                buf[base + i] = x1 * c - x2 * s
+                buf[base + half + i] = x1 * s + x2 * c
+                i += 1
+            }
+        }
+        var t = 0
+        while t < rows {
+            var h = 0
+            while h < heads {
+                rotate(&q, base: (t * heads + h) * hd, position: start + t)
+                h += 1
+            }
+            rotate(&k, base: t * hd, position: start + t)
+            t += 1
+        }
+        let cachedRows = state.attentionKeys[b].count / hd
+        let keys = state.attentionKeys[b] + k
+        let values = state.attentionValues[b] + v
+        let cacheStart = start - cachedRows
+        let scale = 1.0 / sqrtf(Float(hd))
+        var out = [Float](repeating: 0.0, count: rows * heads * hd)
+        var scores = [Float](repeating: 0.0, count: w.attentionWindow)
+        t = 0
+        while t < rows {
+            let position = start + t
+            let first = max(0, max(cacheStart, position - w.attentionWindow + 1))
+            let count = position - first + 1
+            var h = 0
+            while h < heads {
+                let qBase = (t * heads + h) * hd
+                var peak = -Float.greatestFiniteMagnitude
+                var j = 0
+                while j < count {
+                    let kBase = (first + j - cacheStart) * hd
+                    var dot: Float = 0.0
+                    var c = 0
+                    while c < hd {
+                        dot += q[qBase + c] * keys[kBase + c]
+                        c += 1
+                    }
+                    scores[j] = dot * scale
+                    if peak < scores[j] {
+                        peak = scores[j]
+                    }
+                    j += 1
+                }
+                var total: Float = 0.0
+                j = 0
+                while j < count {
+                    scores[j] = expf(scores[j] - peak)
+                    total += scores[j]
+                    j += 1
+                }
+                j = 0
+                while j < count {
+                    let p = scores[j] / total
+                    let vBase = (first + j - cacheStart) * hd
+                    var c = 0
+                    while c < hd {
+                        out[qBase + c] += p * values[vBase + c]
+                        c += 1
+                    }
+                    j += 1
+                }
+                h += 1
+            }
+            t += 1
+        }
+        let keep = min(w.attentionWindow - 1, cachedRows + rows)
+        state.attentionKeys[b] = Array(keys[((cachedRows + rows - keep) * hd)...])
+        state.attentionValues[b] = Array(values[((cachedRows + rows - keep) * hd)...])
+        state.attentionPosition[b] = start + rows
+        Self.gemm(out, aw.wO, &x, m: rows, n: d, k: heads * hd, beta: 1.0)
+
+        var mlpGate = [Float](repeating: 0.0, count: rows * m)
+        var mlpUp = [Float](repeating: 0.0, count: rows * m)
+        Self.rmsNorm(x, aw.norm2, &normed, frames: rows, width: d)
+        Self.gemm(normed, aw.wMLPGate, &mlpGate, m: rows, n: m, k: d)
+        Self.gemm(normed, aw.wMLPUp, &mlpUp, m: rows, n: m, k: d)
+        Self.geluInPlace(&mlpGate)
+        Self.multiplyInPlace(&mlpGate, mlpUp)
+        Self.gemm(mlpGate, aw.wMLPDown, &x, m: rows, n: d, k: m, beta: 1.0)
+        return x
     }
 
     private func logSoftmaxRows(_ logits: [Float]) -> [[Float]] {

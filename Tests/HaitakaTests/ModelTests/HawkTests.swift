@@ -114,6 +114,37 @@ final class HawkTests: XCTestCase {
         assertClose(MLXArray(got.flatMap { $0 }, [1, frames, 7]), expected, 2e-4)
     }
 
+    /// Local attention blocks: chunked CPU inference with cached keys matches the MLX forward pass, with and
+    /// without lookahead, and for sequences longer than the window.
+    func testForwardMatchesWithLocalAttention() {
+        for (convRight, chunk) in [(0, 5), (2, 3), (1, 64)] {
+            let net = MLXHawkNetwork(inputDim: 12, modelDim: 16, rnnDim: 24, mlpDim: 32, heads: 3, convWidth: 4, convRight: convRight,
+                                     numLayers: 2, outputDim: 7, attentionAfter: [0, 1], attentionHeads: 2, attentionWindow: 9)
+            let frames = 37
+            let features = makeFeatures(frames: frames, dim: 12)
+            let logits = net(MLXArray(features.flatMap { $0 }, [1, frames, 12]))
+            let expected = logits - logSumExp(logits, axis: -1, keepDims: true)
+            let weights = net.exportWeights()
+            XCTAssertEqual(weights.attention.count, 2)
+            XCTAssertEqual(weights.parameterCount, net.parameters().flattened().reduce(0) { $0 + $1.1.size })
+            let got = HawkNetwork(weights: weights).logProbs(features: features, chunkFrames: chunk)
+            XCTAssertEqual(got.count, frames)
+            assertClose(MLXArray(got.flatMap { $0 }, [1, frames, 7]), expected, 2e-4)
+        }
+    }
+
+    /// Weights saved without attention still load, with no attention blocks.
+    func testWeightsWithoutAttentionStillDecode() throws {
+        let weights = smallNetwork(convRight: 1).exportWeights()
+        var json = try JSONSerialization.jsonObject(with: try JSONEncoder().encode(weights)) as! [String: Any]
+        json.removeValue(forKey: "attention")
+        json.removeValue(forKey: "attentionHeads")
+        json.removeValue(forKey: "attentionWindow")
+        let decoded = try JSONDecoder().decode(HawkWeights.self, from: try JSONSerialization.data(withJSONObject: json))
+        XCTAssertEqual(decoded, weights)
+        XCTAssertTrue(decoded.attention.isEmpty)
+    }
+
     /// In a padded batch, frames past a sequence's length enter the lookahead convolution as zeros, as in the CPU flush.
     func testFrameCountsMaskMatchesSingleSequence() {
         let net = smallNetwork(convRight: 2)

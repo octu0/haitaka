@@ -16,10 +16,11 @@ enum Defaults {
     /// Longest utterance used for training (40 ms frames, 60 s).
     static let maxTrainFrames = 1500
 
+    /// Peak learning rate of a fresh run; the cosine then decays to zero over the whole run, so longer runs
+    /// spend more steps at every rate instead of idling at a floor.
     static let lrMax: Float = 0.003
+    /// Starting rate when continuing from trained weights (annealing to zero).
     static let lrMin: Float = 0.0005
-    /// Upper bound of the cosine decay in steps; longer runs continue at lrMin.
-    static let lrDecaySteps = 50_000
     static let warmupStepDivisor = 50
     static let minWarmupSteps = 100
     /// Roll back to the best weights and scale the learning rate when the epoch loss rises this many times in a row.
@@ -372,7 +373,7 @@ if 0 < epochs {
     }
     print("  parameters \(mlxNetwork.exportWeights().parameterCount), batch \(batchSize)")
     let trainer = MLXHawkTrainer(network: mlxNetwork, learningRate: Defaults.lrMax)
-    var scheduler = CosineLRScheduler(lrMax: Defaults.lrMax, lrMin: Defaults.lrMin)
+    var scheduler = CosineLRScheduler(lrMax: Defaults.lrMax, lrMin: 0.0)
     // Fine-tuning from trained weights anneals from lrMin to zero over the whole run, without warmup.
     if importedWeights != nil {
         scheduler = CosineLRScheduler(lrMax: Defaults.lrMin, lrMin: 0.0)
@@ -479,15 +480,14 @@ if 0 < epochs {
 
     let totalSteps = max(1, epochs * batchGroups.count)
     var warmupSteps = min(max(Defaults.minWarmupSteps, totalSteps / Defaults.warmupStepDivisor), max(1, totalSteps / 2))
-    var decaySteps = min(totalSteps - warmupSteps, Defaults.lrDecaySteps)
     if importedWeights != nil {
         warmupSteps = 0
-        decaySteps = totalSteps
     }
-    let scheduleSteps = warmupSteps + decaySteps
-    print("  training steps: \(totalSteps) (warmup \(warmupSteps), decay \(decaySteps), then lrMin)")
+    let scheduleSteps = totalSteps
+    print("  training steps: \(totalSteps) (warmup \(warmupSteps), then cosine decay to zero)")
 
-    let checkpointInterval = min(Defaults.checkpointEvery, max(1, epochs / 6))
+    // Runs up to 20 epochs keep every epoch (the dev score picks the epoch); longer runs thin the checkpoints out.
+    let checkpointInterval = max(1, min(Defaults.checkpointEvery, epochs / 20))
     print("  checkpoint interval: every \(checkpointInterval) epochs")
 
     var bestLoss = Float.greatestFiniteMagnitude
