@@ -11,9 +11,7 @@ public final class StreamingFeatureFrontEnd: @unchecked Sendable {
     /// 64 smoothed mel + 64 deltas
     public static let tapDim = 128
     /// Four 10 ms hops stacked into one 40 ms frame. 10 ms is too fine for CTC, and the number of recurrent steps drives training time.
-    public static let frameStack = Int(ProcessInfo.processInfo.environment["HAITAKA_DSP_STACK"] ?? "") ?? 4
-    /// Experiment switch (10-19): HAITAKA_DSP_NOSMOOTH=1 stacks each 10 ms hop as is instead of the 3-tap average.
-    static let noSmoothing: Bool = ProcessInfo.processInfo.environment["HAITAKA_DSP_NOSMOOTH"] == "1"
+    public static let frameStack = 4
     /// Target RMS for gain normalization (matches the level of the training data).
     public static let targetRMS: Float = 0.05
     /// Gain cap so near-silent clips do not amplify noise.
@@ -229,9 +227,6 @@ public final class StreamingFeatureFrontEnd: @unchecked Sendable {
             let xCurr = curr[c]
             let xNext = next[c]
             tapFrame[c] = (0.25 * xPrev) + (0.5 * xCurr) + (0.25 * xNext)
-            if Self.noSmoothing {
-                tapFrame[c] = xCurr
-            }
             tapFrame[Self.melChannels + c] = 0.5 * (xNext - xPrev)
             c += 1
         }

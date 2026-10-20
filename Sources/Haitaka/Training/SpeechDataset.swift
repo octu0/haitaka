@@ -166,15 +166,8 @@ public final class SpeechDataset: @unchecked Sendable {
 
         var sumSquares: Float = 0.0
         var rIdx = 0
-        // Experiment switch (10-19): HAITAKA_DSP_RANGE=1 measures the RMS after pre-emphasis, so the gain levels the
-        // signal the filterbank actually sees instead of the raw waveform dominated by the low band.
-        let preemphasizedGain = ProcessInfo.processInfo.environment["HAITAKA_DSP_PREGAIN"] == "1"
         while rIdx < totalSamples {
-            var x = pcmData[rIdx]
-            if preemphasizedGain && 0 < rIdx {
-                x = pcmData[rIdx] - 0.97 * pcmData[rIdx - 1]
-            }
-            sumSquares += x * x
+            sumSquares += pcmData[rIdx] * pcmData[rIdx]
             rIdx += 1
         }
         let rms = sqrtf(sumSquares / Float(totalSamples))

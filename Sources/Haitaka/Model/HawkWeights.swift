@@ -11,10 +11,9 @@ public enum HawkShape {
     public static let convWidth = 4
     /// Future frames per layer. Total delay is numLayers × convRight frames of 40 ms.
     public static let convRight = 2
-    /// Griffin-style local attention blocks, each run after the recurrent layer with this index. Experiment switch
-    /// (10-19): HAITAKA_ATTN_AFTER=2,5 enables them; the default stays recurrent-only until the A/B picks.
-    public static let attentionAfter: [Int] = (ProcessInfo.processInfo.environment["HAITAKA_ATTN_AFTER"] ?? "")
-        .split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+    /// Griffin-style local attention blocks, each run after the recurrent layer with this index
+    /// (11.0M parameters in total with the default shape).
+    public static let attentionAfter = [3, 7]
     /// Query heads of the local attention; keys and values share one head (multi-query).
     public static let attentionHeads = 8
     /// Frames each query may look back over (2.56 s at 40 ms), the current frame included. Strictly causal.

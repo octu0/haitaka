@@ -364,9 +364,10 @@ if 0 < epochs {
     let allTargets: [[Int]] = (0..<dataset.count).map { kanaVocabulary.textToIds(dataset.hiraganaText(at: $0)) }
 
     MLXRandom.seed(Defaults.seed)
-    let mlxNetwork = MLXHawkNetwork(outputDim: kanaVocabulary.size)
+    // Continuing from trained weights keeps their shape (attention blocks included); fresh runs use HawkShape.
+    var mlxNetwork = MLXHawkNetwork(outputDim: kanaVocabulary.size)
     if let weights = importedWeights {
-        mlxNetwork.importWeights(from: weights)
+        mlxNetwork = MLXHawkNetwork(weights: weights)
     }
     if let weights = pretrainedWeights {
         mlxNetwork.importEncoder(from: weights)
