@@ -9,6 +9,8 @@ public final class HawkNetwork: @unchecked Sendable {
     public let weights: HawkWeights
     /// Per layer, c · log σ(Λ), so that log a_t = r_t · logDecay.
     private let logDecay: [[Float]]
+    /// Rotary frequencies of the attention blocks, one per pair of a head.
+    private let attentionFrequencies: [Double]
 
     /// Streaming state for one utterance. With lookahead (`convRight`), each layer holds frames until
     /// their right context arrives, so output lags input by `convRight × numLayers` frames.
@@ -39,6 +41,8 @@ public final class HawkNetwork: @unchecked Sendable {
     public init(weights: HawkWeights) {
         precondition(weights.modelDim % 8 == 0 && weights.rnnDim % 8 == 0 && weights.mlpDim % 8 == 0, "widths must be multiples of 8")
         self.weights = weights
+        let half = weights.attentionHeadDim / 2
+        self.attentionFrequencies = (0..<half).map { pow(10000.0, -2.0 * Double($0) / Double(weights.attentionHeadDim)) }
         self.logDecay = weights.layers.map { layer in
             layer.lambda.map { lambda -> Float in
                 // Numerically stable log σ(Λ).
@@ -168,27 +172,33 @@ public final class HawkNetwork: @unchecked Sendable {
         Self.gemm(normed, aw.wV, &v, m: rows, n: hd, k: d)
         let start = state.attentionPosition[b]
         // Rotary positions; angles in Double so hours-long streams keep their relative phases.
-        func rotate(_ buf: inout [Float], base: Int, position: Int) {
+        var cosines = [Float](repeating: 0.0, count: half)
+        var sines = [Float](repeating: 0.0, count: half)
+        func rotate(_ buf: inout [Float], base: Int) {
             var i = 0
             while i < half {
-                let angle = Double(position) * pow(10000.0, -2.0 * Double(i) / Double(hd))
-                let c = Float(cos(angle))
-                let s = Float(sin(angle))
                 let x1 = buf[base + i]
                 let x2 = buf[base + half + i]
-                buf[base + i] = x1 * c - x2 * s
-                buf[base + half + i] = x1 * s + x2 * c
+                buf[base + i] = x1 * cosines[i] - x2 * sines[i]
+                buf[base + half + i] = x1 * sines[i] + x2 * cosines[i]
                 i += 1
             }
         }
         var t = 0
         while t < rows {
+            var i = 0
+            while i < half {
+                let angle = Double(start + t) * attentionFrequencies[i]
+                cosines[i] = Float(cos(angle))
+                sines[i] = Float(sin(angle))
+                i += 1
+            }
             var h = 0
             while h < heads {
-                rotate(&q, base: (t * heads + h) * hd, position: start + t)
+                rotate(&q, base: (t * heads + h) * hd)
                 h += 1
             }
-            rotate(&k, base: t * hd, position: start + t)
+            rotate(&k, base: t * hd)
             t += 1
         }
         let cachedRows = state.attentionKeys[b].count / hd
@@ -197,53 +207,44 @@ public final class HawkNetwork: @unchecked Sendable {
         let cacheStart = start - cachedRows
         let scale = 1.0 / sqrtf(Float(hd))
         var out = [Float](repeating: 0.0, count: rows * heads * hd)
-        var scores = [Float](repeating: 0.0, count: w.attentionWindow)
-        t = 0
-        while t < rows {
-            let position = start + t
-            let first = max(0, max(cacheStart, position - w.attentionWindow + 1))
-            let count = position - first + 1
-            var h = 0
-            while h < heads {
-                let qBase = (t * heads + h) * hd
-                var peak = -Float.greatestFiniteMagnitude
-                var j = 0
-                while j < count {
-                    let kBase = (first + j - cacheStart) * hd
-                    var dot: Float = 0.0
-                    var c = 0
-                    while c < hd {
-                        dot += q[qBase + c] * keys[kBase + c]
-                        c += 1
-                    }
-                    scores[j] = dot * scale
-                    if peak < scores[j] {
-                        peak = scores[j]
-                    }
-                    j += 1
+        var scores = [Float](repeating: 0.0, count: heads * w.attentionWindow)
+        q.withUnsafeBufferPointer { qp in
+        keys.withUnsafeBufferPointer { kp in
+        values.withUnsafeBufferPointer { vp in
+        out.withUnsafeMutableBufferPointer { op in
+        scores.withUnsafeMutableBufferPointer { sp in
+            var t = 0
+            while t < rows {
+                let position = start + t
+                let first = max(0, max(cacheStart, position - w.attentionWindow + 1))
+                let count = position - first + 1
+                let window = first - cacheStart
+                // scores [heads, count] = Q_t [heads, hd] · K_window^T
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, Int32(heads), Int32(count), Int32(hd),
+                            scale, qp.baseAddress! + t * heads * hd, Int32(hd), kp.baseAddress! + window * hd, Int32(hd),
+                            0.0, sp.baseAddress!, Int32(count))
+                var h = 0
+                while h < heads {
+                    let row = sp.baseAddress! + h * count
+                    var peak: Float = 0.0
+                    vDSP_maxv(row, 1, &peak, vDSP_Length(count))
+                    var shift = -peak
+                    vDSP_vsadd(row, 1, &shift, row, 1, vDSP_Length(count))
+                    var n = Int32(count)
+                    vvexpf(row, row, &n)
+                    var total: Float = 0.0
+                    vDSP_sve(row, 1, &total, vDSP_Length(count))
+                    var inv = 1.0 / total
+                    vDSP_vsmul(row, 1, &inv, row, 1, vDSP_Length(count))
+                    h += 1
                 }
-                var total: Float = 0.0
-                j = 0
-                while j < count {
-                    scores[j] = expf(scores[j] - peak)
-                    total += scores[j]
-                    j += 1
-                }
-                j = 0
-                while j < count {
-                    let p = scores[j] / total
-                    let vBase = (first + j - cacheStart) * hd
-                    var c = 0
-                    while c < hd {
-                        out[qBase + c] += p * values[vBase + c]
-                        c += 1
-                    }
-                    j += 1
-                }
-                h += 1
+                // out_t [heads, hd] = P [heads, count] · V_window [count, hd]
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, Int32(heads), Int32(hd), Int32(count),
+                            1.0, sp.baseAddress!, Int32(count), vp.baseAddress! + window * hd, Int32(hd),
+                            0.0, op.baseAddress! + t * heads * hd, Int32(hd))
+                t += 1
             }
-            t += 1
-        }
+        }}}}}
         let keep = min(w.attentionWindow - 1, cachedRows + rows)
         state.attentionKeys[b] = Array(keys[((cachedRows + rows - keep) * hd)...])
         state.attentionValues[b] = Array(values[((cachedRows + rows - keep) * hd)...])
