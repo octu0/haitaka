@@ -176,9 +176,15 @@ public final class MLXHawkLayer: Module, @unchecked Sendable {
             u = u + paddedRaw[0..., k..<(k + frames), 0...] * convW[k]
             k += 1
         }
-        let blocks = u.reshaped([batch, frames, heads, 1, headDim])
-        let r = sigmoid(matmul(blocks, wA).reshaped([batch, frames, rnnDim]) + bA)
-        let i = sigmoid(matmul(blocks, wI).reshaped([batch, frames, rnnDim]) + bI)
+        // Block-diagonal gates as one batched matmul per head, [heads, B·T, headDim] · [heads, headDim, headDim].
+        // Multiplying [B, T, heads, 1, headDim] blocks instead broadcasts the gate weights over every frame in the
+        // backward pass, which costs memory and time in proportion to B · T · headDim².
+        let blocks = u.reshaped([batch * frames, heads, headDim]).transposed(1, 0, 2)
+        func gate(_ w: MLXArray, _ bias: MLXArray) -> MLXArray {
+            return sigmoid(matmul(blocks, w).transposed(1, 0, 2).reshaped([batch, frames, rnnDim]) + bias)
+        }
+        let r = gate(wA, bA)
+        let i = gate(wI, bI)
         // log a_t = c · r_t · log σ(Λ)
         let logA = (HawkWeights.decayExponent * r) * logSigmoid(lambda)
         let a = exp(logA)

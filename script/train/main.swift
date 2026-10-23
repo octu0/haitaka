@@ -31,8 +31,8 @@ enum Defaults {
     static let checkpointEvery = 10
     static let batchSize = 64
     /// Longest padded batch (in frames) that still gets the full `batchSize` at the default width. Longer batches
-    /// get fewer utterances, and the budget shrinks with the square of the width: measured peak memory on the longest
-    /// utterances is about 21 GB for 1×, 2× and 4× width this way (a linear budget left 4× at 66 GB and in swap).
+    /// get fewer utterances, and wider models proportionally fewer: peak memory on the longest utterances stays
+    /// near 19 GB for 1×, 2× and 4× width.
     static let fullBatchFrames = 512
     /// Seeds weight initialization, batch order and augmentation, so two runs differ only by their data.
     static let seed: UInt64 = 1
@@ -434,9 +434,9 @@ if 0 < epochs {
     let lengthSortedIndices = feasibleIndices.sorted { a, b in
         return dataset.frameCount(at: a) < dataset.frameCount(at: b)
     }
-    // Batches are capped by utterances × padded frames × width², the measured growth of peak memory.
+    // Activation memory grows with utterances × padded frames × width, so batches are capped by that product.
     let widthRatio = Double(mlxNetwork.modelDim) / Double(HawkShape.defaultModelDim)
-    let frameBudget = Int(Double(batchSize * Defaults.fullBatchFrames) / (widthRatio * widthRatio))
+    let frameBudget = Int(Double(batchSize * Defaults.fullBatchFrames) / widthRatio)
     var batchGroups: [[Int]] = []
     var current: [Int] = []
     for idx in lengthSortedIndices {
