@@ -30,6 +30,10 @@ enum Defaults {
 
     static let checkpointEvery = 10
     static let batchSize = 64
+    /// Longest padded batch (in frames) that still gets the full `batchSize` at the default width. Longer batches
+    /// get fewer utterances, and the budget shrinks with the square of the width: measured peak memory on the longest
+    /// utterances is about 21 GB for 1×, 2× and 4× width this way (a linear budget left 4× at 66 GB and in swap).
+    static let fullBatchFrames = 512
     /// Seeds weight initialization, batch order and augmentation, so two runs differ only by their data.
     static let seed: UInt64 = 1
     /// Batches within this window are reordered so equal padded lengths run back to back; compiled steps
@@ -343,17 +347,24 @@ print("\n--- 2. Training the acoustic model ---")
 let inputDim = StreamingFeatureFrontEnd.inputDim
 print("Hawk: input \(inputDim), layers \(HawkShape.numLayers), width \(HawkShape.modelDim), RNN width \(HawkShape.rnnDim), MLP width \(HawkShape.mlpDim), gate blocks \(HawkShape.heads), conv \(HawkShape.convWidth) frames, lookahead \(HawkShape.convRight) frames/layer")
 
-for weights in [importedWeights, pretrainedWeights].compactMap({ $0 }) {
-    guard weights.outputDim == kanaVocabulary.size || weights.vocabulary == nil,
-          weights.inputDim == inputDim,
+// Imported weights bring their own shape; only the input features and the kana readout must match.
+if let weights = importedWeights {
+    guard weights.outputDim == kanaVocabulary.size || weights.vocabulary == nil, weights.inputDim == inputDim else {
+        print("error: imported weights do not match (input \(weights.inputDim)/\(inputDim), output \(weights.outputDim)/\(kanaVocabulary.size))")
+        exit(1)
+    }
+}
+// Pretrained layers are copied into a network of the default shape, so the shape must match it.
+if let weights = pretrainedWeights {
+    guard weights.inputDim == inputDim,
           weights.numLayers == HawkShape.numLayers,
           weights.modelDim == HawkShape.modelDim,
           weights.rnnDim == HawkShape.rnnDim,
           weights.mlpDim == HawkShape.mlpDim,
           weights.heads == HawkShape.heads,
           weights.convWidth == HawkShape.convWidth,
-          weights.convRight == HawkShape.convRight || epochs == 0 else {
-        print("error: weights do not match Defaults (input \(weights.inputDim)/\(inputDim), output \(weights.outputDim)/\(kanaVocabulary.size), layers \(weights.numLayers)/\(HawkShape.numLayers), width \(weights.modelDim)/\(HawkShape.modelDim), lookahead \(weights.convRight)/\(HawkShape.convRight))")
+          weights.convRight == HawkShape.convRight else {
+        print("error: pretrained weights do not match HawkShape (input \(weights.inputDim)/\(inputDim), layers \(weights.numLayers)/\(HawkShape.numLayers), width \(weights.modelDim)/\(HawkShape.modelDim), lookahead \(weights.convRight)/\(HawkShape.convRight))")
         exit(1)
     }
 }
@@ -423,13 +434,26 @@ if 0 < epochs {
     let lengthSortedIndices = feasibleIndices.sorted { a, b in
         return dataset.frameCount(at: a) < dataset.frameCount(at: b)
     }
+    // Batches are capped by utterances × padded frames × width², the measured growth of peak memory.
+    let widthRatio = Double(mlxNetwork.modelDim) / Double(HawkShape.defaultModelDim)
+    let frameBudget = Int(Double(batchSize * Defaults.fullBatchFrames) / (widthRatio * widthRatio))
     var batchGroups: [[Int]] = []
-    var gStart = 0
-    while gStart < lengthSortedIndices.count {
-        let gEnd = min(gStart + batchSize, lengthSortedIndices.count)
-        batchGroups.append(Array(lengthSortedIndices[gStart..<gEnd]))
-        gStart = gEnd
+    var current: [Int] = []
+    for idx in lengthSortedIndices {
+        let padded = ((dataset.frameCount(at: idx) + 31) / 32) * 32
+        let fits = (current.count + 1) * padded <= frameBudget
+        if current.isEmpty != true && (current.count == batchSize || fits != true) {
+            batchGroups.append(current)
+            current = []
+        }
+        current.append(idx)
     }
+    if current.isEmpty != true {
+        batchGroups.append(current)
+    }
+    let fullBatches = batchGroups.filter { $0.count == batchSize }.count
+    let smallest = batchGroups.map { $0.count }.min() ?? 0
+    print("  batches: \(batchGroups.count) (\(fullBatches) of \(batchSize), smallest \(smallest) for the longest utterances)")
 
     func paddedFrameCount(of group: [Int]) -> Int {
         var maxFrames = 0

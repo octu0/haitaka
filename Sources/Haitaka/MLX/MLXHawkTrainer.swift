@@ -15,14 +15,17 @@ public final class MLXHawkTrainer: @unchecked Sendable {
     private var compiledSteps: [Int: ([MLXArray]) -> [MLXArray]] = [:]
     private var compiledClusterSteps: [Int: ([MLXArray]) -> [MLXArray]] = [:]
 
-    /// MLX buffer cache limit. Each padded sequence length needs its own buffers, so the cache grows without
-    /// bound; a limit below one step's working set forces reallocation every step and slows training.
+    /// MLX buffer cache limit at the default width. Each padded sequence length needs its own buffers, so the cache
+    /// grows without bound; a limit below one step's working set forces reallocation every step and slows training.
+    /// Wider models get a proportionally smaller cache (down to `minCacheLimitBytes`) so cache plus activations fit.
     public static let cacheLimitBytes = 24 << 30
+    public static let minCacheLimitBytes = 6 << 30
 
     public init(network: MLXHawkNetwork, learningRate: Float) {
         self.network = network
         self.optimizer = ArrayLRAdam(learningRate: learningRate)
-        MLX.GPU.set(cacheLimit: Self.cacheLimitBytes)
+        let scaled = Self.cacheLimitBytes / max(1, network.modelDim / HawkShape.defaultModelDim)
+        MLX.GPU.set(cacheLimit: max(Self.minCacheLimitBytes, scaled))
     }
 
     public func updateLearningRate(_ lr: Float) {

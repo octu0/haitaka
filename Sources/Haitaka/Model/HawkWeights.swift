@@ -4,6 +4,8 @@ import Foundation
 public enum HawkShape {
     public static let numLayers = 8
     public static let modelDim = 288
+    /// Width the memory budgets are calibrated at (batch sizes and the MLX buffer cache scale down from it).
+    public static let defaultModelDim = 288
     public static let rnnDim = 384
     public static let mlpDim = 864
     /// Number of diagonal blocks in the RG-LRU gates.
