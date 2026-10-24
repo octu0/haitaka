@@ -17,8 +17,9 @@ enum Defaults {
     static let maxTrainFrames = 1500
 
     /// Peak learning rate of a fresh run; the cosine then decays to zero over the whole run, so longer runs
-    /// spend more steps at every rate instead of idling at a floor.
-    static let lrMax: Float = 0.003
+    /// spend more steps at every rate instead of idling at a floor. Scaled inversely with the width
+    /// (0.003 at 288, 0.0015 at 576, 0.00075 at 1152).
+    static let lrMax: Float = 0.00075
     /// Starting rate when continuing from trained weights (annealing to zero).
     static let lrMin: Float = 0.0005
     static let warmupStepDivisor = 50

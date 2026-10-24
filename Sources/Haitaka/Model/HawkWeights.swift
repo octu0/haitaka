@@ -1,20 +1,20 @@
 import Foundation
 
-/// Default model shape (9.1M parameters), shared by training and pretraining.
+/// Default model shape (173M parameters with the attention blocks), shared by training and pretraining.
+/// Four times the width the memory budgets are calibrated at (`defaultModelDim`).
 public enum HawkShape {
     public static let numLayers = 8
-    public static let modelDim = 288
+    public static let modelDim = 1152
     /// Width the memory budgets are calibrated at (batch sizes and the MLX buffer cache scale down from it).
     public static let defaultModelDim = 288
-    public static let rnnDim = 384
-    public static let mlpDim = 864
+    public static let rnnDim = 1536
+    public static let mlpDim = 3456
     /// Number of diagonal blocks in the RG-LRU gates.
     public static let heads = 8
     public static let convWidth = 4
     /// Future frames per layer. Total delay is numLayers × convRight frames of 40 ms.
     public static let convRight = 2
-    /// Griffin-style local attention blocks, each run after the recurrent layer with this index
-    /// (11.0M parameters in total with the default shape).
+    /// Griffin-style local attention blocks, each run after the recurrent layer with this index.
     public static let attentionAfter = [3, 7]
     /// Query heads of the local attention; keys and values share one head (multi-query).
     public static let attentionHeads = 8
