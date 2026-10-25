@@ -13,6 +13,7 @@ let package = Package(
         .executable(name: "mictrans", targets: ["mictrans"]),
         .executable(name: "stage2", targets: ["stage2"]),
         .executable(name: "kanalm", targets: ["kanalm"]),
+        .executable(name: "kanatext", targets: ["kanatext"]),
         .executable(name: "pretrain", targets: ["pretrain"]),
         .executable(name: "screen", targets: ["screen"]),
         .executable(name: "segment", targets: ["segment"]),
@@ -46,6 +47,12 @@ let package = Package(
         .executableTarget(name: "mictrans", dependencies: ["Haitaka"], path: "Sources/mictrans"),
         .executableTarget(name: "stage2", dependencies: ["Haitaka"], path: "script/stage2"),
         .executableTarget(name: "kanalm", dependencies: ["Haitaka"], path: "script/kanalm"),
+        .executableTarget(
+            name: "kanatext",
+            dependencies: ["Haitaka", .product(name: "MLX", package: "mlx-swift"), .product(name: "MLXNN", package: "mlx-swift"),
+                           .product(name: "MLXOptimizers", package: "mlx-swift")],
+            path: "script/kanatext"
+        ),
         .executableTarget(name: "screen", dependencies: ["Haitaka"], path: "script/screen"),
         .executableTarget(name: "segment", dependencies: ["Haitaka"], path: "script/segment"),
         .executableTarget(
