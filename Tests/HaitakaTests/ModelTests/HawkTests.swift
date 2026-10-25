@@ -74,6 +74,49 @@ final class HawkTests: XCTestCase {
         assertClose(kernelGrad[1], referenceGrad[1], 1e-3)
     }
 
+    /// Reference local attention as a dense masked softmax over all frame pairs.
+    private func denseLocalAttention(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray, window: Int) -> MLXArray {
+        let frames = q.shape[1]
+        let scores = matmul(q.transposed(0, 2, 1, 3), k.expandedDimensions(axis: 1).transposed(0, 1, 3, 2))
+        let t = MLXArray(0..<frames).reshaped([frames, 1])
+        let s = MLXArray(0..<frames).reshaped([1, frames])
+        let allowed = logicalAnd(s .<= t, t - s .< window)
+        let p = softmax(MLX.where(allowed, scores, MLXArray(Float(-1e9))), axis: -1)
+        return matmul(p, v.expandedDimensions(axis: 1)).transposed(0, 2, 1, 3)
+    }
+
+    /// The fused local attention kernel matches the dense reference in value and gradient, for head sizes and
+    /// windows that do not fill whole SIMD groups and for windows wider than 32 offsets.
+    func testLocalAttentionMatchesDenseForwardAndGradient() {
+        for window in [9, 40] {
+            let q = MLXRandom.normal([2, 45, 3, 36])
+            let k = MLXRandom.normal([2, 45, 36])
+            let v = MLXRandom.normal([2, 45, 36])
+            let weight = MLXRandom.normal([2, 45, 3, 36])
+            assertClose(MLXLocalAttention.attend(q, k, v, window: window), denseLocalAttention(q, k, v, window: window), 1e-4)
+
+            // One input at a time: grad over a three-array list returns zero for the third.
+            var i = 0
+            while i < 3 {
+                func inputs(_ x: MLXArray) -> [MLXArray] {
+                    var arrays = [q, k, v]
+                    arrays[i] = x
+                    return arrays
+                }
+                let kernelGrad = grad({ (x: MLXArray) -> MLXArray in
+                    let a = inputs(x)
+                    return sum(MLXLocalAttention.attend(a[0], a[1], a[2], window: window) * weight)
+                })([q, k, v][i])
+                let referenceGrad = grad({ (x: MLXArray) -> MLXArray in
+                    let a = inputs(x)
+                    return sum(self.denseLocalAttention(a[0], a[1], a[2], window: window) * weight)
+                })([q, k, v][i])
+                assertClose(kernelGrad, referenceGrad, 1e-3)
+                i += 1
+            }
+        }
+    }
+
     /// Chunked CPU inference with carried state matches the full-sequence MLX forward pass.
     func testForwardMatchesBetweenMLXAndCPU() {
         assertForwardMatches(convRight: 0, chunkFrames: 5)

@@ -90,6 +90,237 @@ public enum MLXLinearScan {
     }
 }
 
+/// Causal local multi-query attention: out[b, t, h] = Σ_o p_o v[b, t-o] over the last W frames (0 ≤ o < W, t-o ≥ 0),
+/// p = softmax_o(q[b, t, h] · k[b, t-o]). q: [B, T, H, D] (already scaled), k, v: [B, T, D].
+/// One SIMD group per (b, t, h) row; each lane holds every 32nd channel and every 32nd offset's score.
+public enum MLXLocalAttention {
+    static let forwardKernel = MLXFast.metalKernel(
+        name: "hawk_local_attention_forward",
+        inputNames: ["q", "k", "v"],
+        outputNames: ["out", "lse"],
+        source: """
+            constexpr int ND = (D + 31) / 32;
+            constexpr int NW = (W + 31) / 32;
+            uint row = thread_position_in_grid.x / 32;
+            uint lane = thread_index_in_simdgroup;
+            if (uint(B * T * H) <= row) {
+                return;
+            }
+            uint bt = row / H;
+            int t = int(bt % T);
+            size_t frame0 = size_t(bt - t) * D;
+            int span = min(W, t + 1);
+            float qr[ND];
+            for (int j = 0; j < ND; ++j) {
+                int d = int(lane) + 32 * j;
+                qr[j] = d < D ? q[size_t(row) * D + d] : 0.0f;
+            }
+            float sc[NW];
+            float top = -INFINITY;
+            for (int o = 0; o < span; ++o) {
+                size_t kb = frame0 + size_t(t - o) * D;
+                float part = 0.0f;
+                for (int j = 0; j < ND; ++j) {
+                    int d = int(lane) + 32 * j;
+                    if (d < D) {
+                        part += qr[j] * k[kb + d];
+                    }
+                }
+                float s = simd_sum(part);
+                if ((o & 31) == int(lane)) {
+                    sc[o >> 5] = s;
+                }
+                top = max(top, s);
+            }
+            float local = 0.0f;
+            for (int j = 0; j < NW; ++j) {
+                int o = int(lane) + 32 * j;
+                if (o < span) {
+                    local += exp(sc[j] - top);
+                }
+            }
+            float logZ = top + log(simd_sum(local));
+            float acc[ND];
+            for (int j = 0; j < ND; ++j) {
+                acc[j] = 0.0f;
+            }
+            for (int o = 0; o < span; ++o) {
+                float p = exp(simd_shuffle(sc[o >> 5], ushort(o & 31)) - logZ);
+                size_t vb = frame0 + size_t(t - o) * D;
+                for (int j = 0; j < ND; ++j) {
+                    int d = int(lane) + 32 * j;
+                    if (d < D) {
+                        acc[j] += p * v[vb + d];
+                    }
+                }
+            }
+            for (int j = 0; j < ND; ++j) {
+                int d = int(lane) + 32 * j;
+                if (d < D) {
+                    out[size_t(row) * D + d] = acc[j];
+                }
+            }
+            if (lane == 0) {
+                lse[row] = logZ;
+            }
+            """
+    )
+
+    /// Per row: dq, and the probabilities p and score gradients ds = p (dp - Σ p dp) for every offset.
+    static let backwardRowKernel = MLXFast.metalKernel(
+        name: "hawk_local_attention_backward_rows",
+        inputNames: ["q", "k", "v", "out", "lse", "g"],
+        outputNames: ["dq", "prob", "dscore"],
+        source: """
+            constexpr int ND = (D + 31) / 32;
+            uint row = thread_position_in_grid.x / 32;
+            uint lane = thread_index_in_simdgroup;
+            if (uint(B * T * H) <= row) {
+                return;
+            }
+            uint bt = row / H;
+            int t = int(bt % T);
+            size_t frame0 = size_t(bt - t) * D;
+            int span = min(W, t + 1);
+            float qr[ND];
+            float gr[ND];
+            float dotOut = 0.0f;
+            for (int j = 0; j < ND; ++j) {
+                int d = int(lane) + 32 * j;
+                qr[j] = 0.0f;
+                gr[j] = 0.0f;
+                if (d < D) {
+                    size_t i = size_t(row) * D + d;
+                    qr[j] = q[i];
+                    gr[j] = g[i];
+                    dotOut += gr[j] * out[i];
+                }
+            }
+            float delta = simd_sum(dotOut);
+            float logZ = lse[row];
+            float acc[ND];
+            for (int j = 0; j < ND; ++j) {
+                acc[j] = 0.0f;
+            }
+            for (int o = 0; o < span; ++o) {
+                size_t kb = frame0 + size_t(t - o) * D;
+                float sPart = 0.0f;
+                float dpPart = 0.0f;
+                for (int j = 0; j < ND; ++j) {
+                    int d = int(lane) + 32 * j;
+                    if (d < D) {
+                        sPart += qr[j] * k[kb + d];
+                        dpPart += gr[j] * v[kb + d];
+                    }
+                }
+                float p = exp(simd_sum(sPart) - logZ);
+                float ds = p * (simd_sum(dpPart) - delta);
+                for (int j = 0; j < ND; ++j) {
+                    int d = int(lane) + 32 * j;
+                    if (d < D) {
+                        acc[j] += ds * k[kb + d];
+                    }
+                }
+                if (lane == 0) {
+                    prob[size_t(row) * W + o] = p;
+                    dscore[size_t(row) * W + o] = ds;
+                }
+            }
+            for (int j = 0; j < ND; ++j) {
+                int d = int(lane) + 32 * j;
+                if (d < D) {
+                    dq[size_t(row) * D + d] = acc[j];
+                }
+            }
+            """
+    )
+
+    /// Per key frame s: dk[s] = Σ_{o,h} ds[s+o, h, o] q[s+o, h], dv[s] = Σ_{o,h} p[s+o, h, o] g[s+o, h].
+    static let backwardKeyKernel = MLXFast.metalKernel(
+        name: "hawk_local_attention_backward_keys",
+        inputNames: ["q", "g", "prob", "dscore"],
+        outputNames: ["dk", "dv"],
+        source: """
+            uint gid = thread_position_in_grid.x;
+            if (uint(B * T * D) <= gid) {
+                return;
+            }
+            int d = int(gid % D);
+            uint bs = gid / D;
+            int s = int(bs % T);
+            size_t b0 = size_t(bs - s);
+            float accK = 0.0f;
+            float accV = 0.0f;
+            int span = min(W, T - s);
+            for (int o = 0; o < span; ++o) {
+                size_t row0 = (b0 + s + o) * H;
+                for (int h = 0; h < H; ++h) {
+                    size_t row = row0 + h;
+                    accK += dscore[row * W + o] * q[row * D + d];
+                    accV += prob[row * W + o] * g[row * D + d];
+                }
+            }
+            dk[gid] = accK;
+            dv[gid] = accV;
+            """
+    )
+
+    static func template(_ q: MLXArray, window: Int) -> [(String, any KernelTemplateArg)] {
+        return [("B", q.dim(0)), ("T", q.dim(1)), ("H", q.dim(2)), ("D", q.dim(3)), ("W", window)]
+    }
+
+    static func forward(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray, window: Int) -> [MLXArray] {
+        let rows = q.dim(0) * q.dim(1) * q.dim(2)
+        return forwardKernel(
+            [q, k, v], template: template(q, window: window), grid: (rows * 32, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [q.shape, [rows]], outputDTypes: [.float32, .float32]
+        )
+    }
+
+    nonisolated(unsafe) static var functions: [Int: ([MLXArray]) -> [MLXArray]] = [:]
+    static let lock = NSLock()
+
+    static func function(window: Int) -> ([MLXArray]) -> [MLXArray] {
+        lock.lock()
+        defer { lock.unlock() }
+        if let f = functions[window] {
+            return f
+        }
+        let f = CustomFunction {
+            Forward { inputs in
+                return [MLXLocalAttention.forward(inputs[0], inputs[1], inputs[2], window: window)[0]]
+            }
+            VJP { primals, cotangents in
+                let q = primals[0]
+                let k = primals[1]
+                let v = primals[2]
+                let forwardOutputs = MLXLocalAttention.forward(q, k, v, window: window)
+                let rows = q.dim(0) * q.dim(1) * q.dim(2)
+                let tmpl = MLXLocalAttention.template(q, window: window)
+                let rowGrads = backwardRowKernel(
+                    [q, k, v, forwardOutputs[0], forwardOutputs[1], cotangents[0]], template: tmpl,
+                    grid: (rows * 32, 1, 1), threadGroup: (256, 1, 1),
+                    outputShapes: [q.shape, [rows, window], [rows, window]], outputDTypes: [.float32, .float32, .float32]
+                )
+                let keyCount = k.size
+                let keyGrads = backwardKeyKernel(
+                    [q, cotangents[0], rowGrads[1], rowGrads[2]], template: tmpl,
+                    grid: (keyCount, 1, 1), threadGroup: (min(256, keyCount), 1, 1),
+                    outputShapes: [k.shape, v.shape], outputDTypes: [.float32, .float32]
+                )
+                return [rowGrads[0], keyGrads[0], keyGrads[1]]
+            }
+        }
+        functions[window] = f
+        return f
+    }
+
+    /// q: [B, T, H, D], k, v: [B, T, D] (float32). Returns [B, T, H, D].
+    public static func attend(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray, window: Int) -> MLXArray {
+        return function(window: window)([q.asType(.float32), k.asType(.float32), v.asType(.float32)])[0]
+    }
+}
+
 /// GeLU approximation x σ(1.702 x); must match the CPU inference path.
 @inline(__always)
 func hawkGelu(_ x: MLXArray) -> MLXArray {
@@ -246,8 +477,7 @@ public final class MLXHawkAttentionLayer: Module, @unchecked Sendable {
         super.init()
     }
 
-    /// x: [B, T, modelDim] → [B, T, modelDim]. Scores are built one look-back offset at a time, so memory grows
-    /// with T × window instead of T².
+    /// x: [B, T, modelDim] → [B, T, modelDim].
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let batch = x.shape[0]
         let frames = x.shape[1]
@@ -272,35 +502,7 @@ public final class MLXHawkAttentionLayer: Module, @unchecked Sendable {
                            cos: cosT.reshaped([frames, 1, half]), sin: sinT.reshaped([frames, 1, half])) * (1.0 / sqrt(Float(headDim)))
         let k = hawkRotary(matmul(n, wK), cos: cosT, sin: sinT)
         let v = matmul(n, wV)
-        let span = min(window, frames)
-        var scores: [MLXArray] = []
-        var values: [MLXArray] = []
-        var offset = 0
-        while offset < span {
-            var kShift = k
-            var vShift = v
-            if 0 < offset {
-                let pad = MLXArray.zeros([batch, offset, headDim])
-                kShift = concatenated([pad, k[0..., 0..<(frames - offset), 0...]], axis: 1)
-                vShift = concatenated([pad, v[0..., 0..<(frames - offset), 0...]], axis: 1)
-            }
-            // [B, T, H]; frames before the sequence start are masked out.
-            var sc = sum(q * kShift.expandedDimensions(axis: 2), axis: -1)
-            if 0 < offset {
-                let positions = MLXArray(0..<frames).reshaped([1, frames, 1])
-                sc = MLX.where(positions .< offset, MLXArray(Float(-1e9)), sc)
-            }
-            scores.append(sc)
-            values.append(vShift)
-            offset += 1
-        }
-        let weights = softmax(stacked(scores, axis: -1), axis: -1)   // [B, T, H, span]
-        var out = MLXArray.zeros([batch, frames, heads, headDim])
-        offset = 0
-        while offset < span {
-            out = out + weights[.ellipsis, offset..<(offset + 1)] * values[offset].expandedDimensions(axis: 2)
-            offset += 1
-        }
+        let out = MLXLocalAttention.attend(q, k, v, window: window)
         let mixed = x + matmul(out.reshaped([batch, frames, heads * headDim]), wO)
         let m = hawkRMSNorm(mixed, norm2)
         return mixed + matmul(hawkGelu(matmul(m, wMLPGate)) * matmul(m, wMLPUp), wMLPDown)
