@@ -28,6 +28,14 @@ final class KanaTextModelTests: XCTestCase {
         XCTAssertEqual(units[0].text, "あい")
     }
 
+    func testRepetitionCountsCopiesOfTheTailSpan() {
+        let t = KanaTextRepetition.tail([9, 1, 2, 3, 1, 2, 3, 1, 2, 3], end: 10)
+        XCTAssertEqual(t.period, 3)
+        XCTAssertEqual(t.count, 3)
+        XCTAssertEqual(KanaTextRepetition.tail([1, 2, 3, 4], end: 4).count, 1)
+        XCTAssertEqual(KanaTextRepetition.longest([5, 6, 5, 6, 7, 7, 7, 7, 8]), 4)
+    }
+
     func testStepDecodingMatchesTeacherForcedDecoding() {
         var shape = KanaTextShape()
         shape.modelDim = 32

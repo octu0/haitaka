@@ -10,7 +10,8 @@ setbuf(stdout, nil)
 // and punctuation, unit by unit (a unit ends at a punctuation mark).
 //   kanatext prepare --english-dict <cmudict> <in.tsv> <out.tsv>      stream \t text  →  stream \t kana \t text
 //   kanatext train --out <dir> [-e epochs] [--eval <prepared.tsv>]... <prepared train.tsv>
-//   kanatext eval --model <dir> [--kana-from <eval dump.jsonl>] <prepared.tsv>...
+//   kanatext eval --model <dir> [--kana-from <eval dump.jsonl>] <prepared.tsv>...  (per line, and per stream: lines in
+//     label order as one sequence). Writes label, text, per-line and per-stream output to <dir>/outputs_<name>.
 // Training reads consecutive lines of a stream as one sequence (up to `chunkKana` kana), so the recurrent state learns
 // to carry context across units. CER compares NFKC text without punctuation and spaces (`scoringForm`).
 
@@ -227,35 +228,61 @@ func loadModel(from dir: String) throws -> (MLXKanaTextModel, KanaTextVocabulary
     return (model, vocabulary)
 }
 
-/// Converts each line on its own (state reset per line); returns (CER %, outputs).
-func evaluate(_ model: MLXKanaTextModel, _ vocabulary: KanaTextVocabulary, _ pairs: [Pair], kana: [String]) -> (Double, [String]) {
-    let order = pairs.indices.sorted { kana[$0].count < kana[$1].count }
+/// The stream a line belongs to: its label without the trailing part and segment numbers. Rewritten script lines
+/// (`_v2`) form their own stream, apart from the original lines.
+func streamKey(_ label: String) -> String {
+    return label.replacingOccurrences(of: #"(_\d{3})?(_seg\d+)?(_v2)?$"#, with: "$3", options: .regularExpression)
+}
+
+/// Converts the lines in groups: alone (state reset per line), or with `streams` all lines of a stream in label order
+/// as one sequence, so the state carries across lines. Returns (CER %, outputs, units cut by the repetition stop).
+func evaluate(_ model: MLXKanaTextModel, _ vocabulary: KanaTextVocabulary, _ pairs: [Pair], kana: [String],
+              streams: Bool = false) -> (Double, [String], Int) {
+    var groups: [[Int]] = pairs.indices.map { [$0] }
+    if streams {
+        let byStream = Dictionary(grouping: pairs.indices, by: { streamKey(pairs[$0].label) })
+        groups = byStream.values.map { $0.sorted { pairs[$0].label < pairs[$1].label } }
+    }
+    let order = groups.indices.sorted { groups[$0].reduce(0) { $0 + kana[$1].count } < groups[$1].reduce(0) { $0 + kana[$1].count } }
     var outputs = [String](repeating: "", count: pairs.count)
+    var cut = 0
     var start = 0
     while start < order.count {
         let rows = Array(order[start..<min(order.count, start + Defaults.evalBatch)])
         var sources: [[Int]] = []
         var spans: [[Range<Int>]] = []
-        for r in rows {
+        var owners: [[Int]] = []
+        for g in rows {
             var ids: [Int] = []
             var units: [Range<Int>] = []
-            for u in KanaTextUnits.splitKana(kana[r]) {
-                let k = vocabulary.encodeInput(u)
-                units.append(ids.count..<(ids.count + k.count))
-                ids += k
+            var owner: [Int] = []
+            for line in groups[g] {
+                for u in KanaTextUnits.splitKana(kana[line]) {
+                    let k = vocabulary.encodeInput(u)
+                    units.append(ids.count..<(ids.count + k.count))
+                    owner.append(line)
+                    ids += k
+                }
             }
             if ids.isEmpty {
                 ids = [KanaTextVocabulary.unknown]
                 units = [0..<1]
+                owner = [groups[g][0]]
             }
             sources.append(ids)
             spans.append(units)
+            owners.append(owner)
         }
         let width = roundUp(sources.map { $0.count }.max() ?? 1)
-        let ids = model.greedy(padded(sources, width: width, fill: KanaTextVocabulary.pad), units: spans)
+        let result = model.greedy(padded(sources, width: width, fill: KanaTextVocabulary.pad), units: spans)
+        cut += result.cut
         var i = 0
         while i < rows.count {
-            outputs[rows[i]] = ids[i].map { vocabulary.decodeOutput($0) }.joined()
+            var j = 0
+            while j < owners[i].count {
+                outputs[owners[i][j]] += vocabulary.decodeOutput(result.units[i][j])
+                j += 1
+            }
             i += 1
         }
         start += Defaults.evalBatch
@@ -269,7 +296,7 @@ func evaluate(_ model: MLXKanaTextModel, _ vocabulary: KanaTextVocabulary, _ pai
         total += ref.count
         i += 1
     }
-    return (100.0 * Double(errors) / Double(max(1, total)), outputs)
+    return (100.0 * Double(errors) / Double(max(1, total)), outputs, cut)
 }
 
 func printExamples(_ pairs: [Pair], _ outputs: [String], count: Int) {
@@ -385,8 +412,8 @@ case "train":
                      CFAbsoluteTimeGetCurrent() - start, MLX.GPU.peakMemory >> 20))
         var selection = 0.0
         for set in evalSets {
-            let (cer, outputs) = evaluate(model, vocabulary, set.pairs, kana: set.pairs.map { $0.kana })
-            print(String(format: "  %@: CER %.2f%% (%d)", set.name, cer, set.pairs.count))
+            let (cer, outputs, cut) = evaluate(model, vocabulary, set.pairs, kana: set.pairs.map { $0.kana })
+            print(String(format: "  %@: CER %.2f%% (%d, %d units cut)", set.name, cer, set.pairs.count, cut))
             if set.name.contains("dev") && selection == 0.0 {
                 selection = cer
             }
@@ -423,14 +450,21 @@ case "eval":
     }
     for path in positional {
         let pairs = readPairs(path)
-        let (cer, outputs) = evaluate(model, vocabulary, pairs, kana: pairs.map { $0.kana })
-        var line = String(format: "%@: reference kana CER %.2f%%", (path as NSString).lastPathComponent, cer)
+        let name = (path as NSString).lastPathComponent
+        let (cer, outputs, cut) = evaluate(model, vocabulary, pairs, kana: pairs.map { $0.kana })
+        let (streamCER, streamOutputs, streamCut) = evaluate(model, vocabulary, pairs, kana: pairs.map { $0.kana }, streams: true)
+        let rows = pairs.indices.map { "\(pairs[$0].label)\t\(pairs[$0].text)\t\(outputs[$0])\t\(streamOutputs[$0])" }
+        try rows.joined(separator: "\n").appending("\n").write(toFile: modelDir + "/outputs_" + name, atomically: true, encoding: .utf8)
+        let streamCount = Set(pairs.map { streamKey($0.label) }).count
+        print(String(format: "%@ (%d lines, %d streams): reference kana CER %.2f%% per line (%d units cut) / %.2f%% per stream (%d units cut)",
+                     name, pairs.count, streamCount, cer, cut, streamCER, streamCut))
         let covered = pairs.filter { predicted[$0.label] != nil }
         if covered.isEmpty != true {
-            let (e2e, _) = evaluate(model, vocabulary, covered, kana: covered.map { predicted[$0.label]! })
-            line += String(format: " / acoustic kana CER %.2f%% (%d)", e2e, covered.count)
+            let kana = covered.map { predicted[$0.label]! }
+            let (e2e, _, _) = evaluate(model, vocabulary, covered, kana: kana)
+            let (e2eStream, _, _) = evaluate(model, vocabulary, covered, kana: kana, streams: true)
+            print(String(format: "  acoustic kana CER %.2f%% per line / %.2f%% per stream (%d lines)", e2e, e2eStream, covered.count))
         }
-        print(line + " (\(pairs.count))")
         printExamples(pairs, outputs, count: Defaults.examples)
     }
 

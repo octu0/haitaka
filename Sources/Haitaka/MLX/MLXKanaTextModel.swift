@@ -176,6 +176,51 @@ public enum KanaTextUnits {
     }
 }
 
+/// Repetition of a span at the end of a sequence, used to stop decoding loops that the unit's kana does not have.
+public enum KanaTextRepetition {
+    static let maxPeriod = 32
+
+    /// The most consecutive copies of any span (period ≤ `maxPeriod`) that end `ids[..<end]`.
+    public static func tail(_ ids: [Int], end: Int) -> (period: Int, count: Int) {
+        var best = (period: 1, count: 1)
+        var p = 1
+        while p <= min(maxPeriod, end / 2) {
+            var c = 1
+            while (c + 1) * p <= end {
+                var same = true
+                var i = 0
+                while i < p {
+                    if ids[end - p + i] != ids[end - (c + 1) * p + i] {
+                        same = false
+                        break
+                    }
+                    i += 1
+                }
+                if same != true {
+                    break
+                }
+                c += 1
+            }
+            if best.count < c {
+                best = (period: p, count: c)
+            }
+            p += 1
+        }
+        return best
+    }
+
+    /// The most consecutive copies of any span anywhere in `ids`.
+    public static func longest(_ ids: [Int]) -> Int {
+        var best = 1
+        var end = 2
+        while end <= ids.count {
+            best = max(best, tail(ids, end: end).count)
+            end += 1
+        }
+        return best
+    }
+}
+
 /// Cross-attention from the decoder to the encoder outputs of the current unit. Pre-RMSNorm, residual.
 final class MLXKanaTextCrossAttention: Module, @unchecked Sendable {
     public var norm: MLXArray
@@ -355,10 +400,17 @@ public final class MLXKanaTextModel: Module, @unchecked Sendable {
     }
 
     /// Greedy streaming conversion of a batch of streams. `units[b]` lists the [start, end) kana spans of row b's
-    /// units in `source` order; returns the text ids of every unit.
-    public func greedy(_ source: MLXArray, units: [[Range<Int>]]) -> [[[Int]]] {
+    /// units in `source` order; returns the text ids of every unit and how many units were cut short. A unit is cut when
+    /// its text ends in more copies of a span than its kana has anywhere (at least two): the extra copies are dropped
+    /// and the unit ends there.
+    public func greedy(_ source: MLXArray, units: [[Range<Int>]]) -> (units: [[[Int]]], cut: Int) {
         let b = source.dim(0)
         let s = source.dim(1)
+        let sourceIds = source.asArray(Int32.self).map { Int($0) }
+        let allowed = (0..<b).map { r in
+            units[r].map { u in max(2, KanaTextRepetition.longest(Array(sourceIds[(r * s + u.lowerBound)..<(r * s + u.upperBound)]))) }
+        }
+        var cut = 0
         let memory = encode(source)
         let kv = cross.map { $0.keysValues(memory) }
         eval(memory)
@@ -398,14 +450,24 @@ public final class MLXKanaTextModel: Module, @unchecked Sendable {
                         produced[r] = 0
                         token[r] = Int32(KanaTextVocabulary.eos)
                     } else {
-                        outputs[r][unitIndex[r]].append(Int(next[r]))
-                        produced[r] += 1
-                        token[r] = next[r]
+                        let u = unitIndex[r]
+                        outputs[r][u].append(Int(next[r]))
+                        let repeated = KanaTextRepetition.tail(outputs[r][u], end: outputs[r][u].count)
+                        if allowed[r][u] < repeated.count {
+                            outputs[r][u].removeLast((repeated.count - 1) * repeated.period)
+                            cut += 1
+                            unitIndex[r] += 1
+                            produced[r] = 0
+                            token[r] = Int32(KanaTextVocabulary.eos)
+                        } else {
+                            produced[r] += 1
+                            token[r] = next[r]
+                        }
                     }
                 }
                 r += 1
             }
         }
-        return outputs
+        return (units: outputs, cut: cut)
     }
 }
