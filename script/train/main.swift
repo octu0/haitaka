@@ -630,7 +630,7 @@ if 0 < epochs {
         }
 
         if let basePath = exportWeightsPath, (ep % checkpointInterval) == 0 && ep < epochs {
-            let ckptPath = "\(basePath).ep\(ep).json"
+            let ckptPath = (basePath as NSString).deletingPathExtension + ".ep\(ep).safetensors"
             do {
                 try mlxNetwork.exportWeights(vocabulary: kanaVocabulary).save(to: URL(fileURLWithPath: ckptPath))
                 print("    ✓ checkpoint saved: \(ckptPath)")

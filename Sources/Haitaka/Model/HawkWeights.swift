@@ -26,7 +26,7 @@ public enum HawkShape {
 /// Each layer is RMSNorm → recurrent block → residual, then RMSNorm → gated MLP → residual.
 /// The recurrent block multiplies a GeLU branch with a linear → causal conv → RG-LRU branch, then projects back.
 /// All matrices are row-major [input, output] (applied as x · W).
-public struct HawkWeights: Sendable, Codable, Equatable {
+public struct HawkWeights: Sendable, Equatable {
     public let inputDim: Int
     public let modelDim: Int
     /// Width of the recurrent block.
@@ -107,29 +107,6 @@ public struct HawkWeights: Sendable, Codable, Equatable {
         return layers.count
     }
 
-    /// Weights saved before the attention blocks existed decode with none.
-    public init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        inputDim = try c.decode(Int.self, forKey: .inputDim)
-        modelDim = try c.decode(Int.self, forKey: .modelDim)
-        rnnDim = try c.decode(Int.self, forKey: .rnnDim)
-        mlpDim = try c.decode(Int.self, forKey: .mlpDim)
-        heads = try c.decode(Int.self, forKey: .heads)
-        convWidth = try c.decode(Int.self, forKey: .convWidth)
-        convRight = try c.decode(Int.self, forKey: .convRight)
-        outputDim = try c.decode(Int.self, forKey: .outputDim)
-        attentionHeads = try c.decodeIfPresent(Int.self, forKey: .attentionHeads) ?? 0
-        attentionWindow = try c.decodeIfPresent(Int.self, forKey: .attentionWindow) ?? 0
-        wIn = try c.decode([Float].self, forKey: .wIn)
-        bIn = try c.decode([Float].self, forKey: .bIn)
-        layers = try c.decode([HawkLayerWeights].self, forKey: .layers)
-        attention = try c.decodeIfPresent([HawkAttentionLayerWeights].self, forKey: .attention) ?? []
-        finalNorm = try c.decode([Float].self, forKey: .finalNorm)
-        wOut = try c.decode([Float].self, forKey: .wOut)
-        bOut = try c.decode([Float].self, forKey: .bOut)
-        vocabularyCharacters = try c.decodeIfPresent(String.self, forKey: .vocabularyCharacters)
-    }
-
     /// Attention head width (modelDim / attentionHeads); 0 without attention.
     public var attentionHeadDim: Int {
         if attentionHeads <= 0 {
@@ -190,19 +167,114 @@ public struct HawkWeights: Sendable, Codable, Equatable {
         return values
     }
 
+    /// Saves as safetensors: tensors named after the fields (`layers.<i>.<field>`, `attention.<j>.<field>`) with the
+    /// shapes in the field comments, and the sizes, `attention.<j>.after` and the vocabulary in the metadata.
     public func save(to url: URL) throws {
-        let data = try JSONEncoder().encode(self)
-        try data.write(to: url, options: .atomic)
+        typealias T = SafeTensors.Tensor
+        var tensors: [(name: String, tensor: T)] = [
+            ("wIn", T(shape: [inputDim, modelDim], values: wIn)),
+            ("bIn", T(shape: [modelDim], values: bIn)),
+        ]
+        var metadata = [
+            "inputDim": "\(inputDim)", "modelDim": "\(modelDim)", "rnnDim": "\(rnnDim)", "mlpDim": "\(mlpDim)",
+            "heads": "\(heads)", "convWidth": "\(convWidth)", "convRight": "\(convRight)", "outputDim": "\(outputDim)",
+            "attentionHeads": "\(attentionHeads)", "attentionWindow": "\(attentionWindow)",
+            "numLayers": "\(layers.count)", "attentionBlocks": "\(attention.count)",
+        ]
+        if let chars = vocabularyCharacters {
+            metadata["vocabularyCharacters"] = chars
+        }
+        for (i, layer) in layers.enumerated() {
+            let p = "layers.\(i)."
+            tensors += [
+                (p + "norm1", T(shape: [modelDim], values: layer.norm1)),
+                (p + "wGate", T(shape: [modelDim, rnnDim], values: layer.wGate)),
+                (p + "wX", T(shape: [modelDim, rnnDim], values: layer.wX)),
+                (p + "convW", T(shape: [convTaps, rnnDim], values: layer.convW)),
+                (p + "convB", T(shape: [rnnDim], values: layer.convB)),
+                (p + "wA", T(shape: [heads, headDim, headDim], values: layer.wA)),
+                (p + "bA", T(shape: [rnnDim], values: layer.bA)),
+                (p + "wI", T(shape: [heads, headDim, headDim], values: layer.wI)),
+                (p + "bI", T(shape: [rnnDim], values: layer.bI)),
+                (p + "lambda", T(shape: [rnnDim], values: layer.lambda)),
+                (p + "wO", T(shape: [rnnDim, modelDim], values: layer.wO)),
+                (p + "norm2", T(shape: [modelDim], values: layer.norm2)),
+                (p + "wMLPGate", T(shape: [modelDim, mlpDim], values: layer.wMLPGate)),
+                (p + "wMLPUp", T(shape: [modelDim, mlpDim], values: layer.wMLPUp)),
+                (p + "wMLPDown", T(shape: [mlpDim, modelDim], values: layer.wMLPDown)),
+            ]
+        }
+        for (j, block) in attention.enumerated() {
+            let p = "attention.\(j)."
+            metadata[p + "after"] = "\(block.after)"
+            tensors += [
+                (p + "norm1", T(shape: [modelDim], values: block.norm1)),
+                (p + "wQ", T(shape: [modelDim, attentionHeads * attentionHeadDim], values: block.wQ)),
+                (p + "wK", T(shape: [modelDim, attentionHeadDim], values: block.wK)),
+                (p + "wV", T(shape: [modelDim, attentionHeadDim], values: block.wV)),
+                (p + "wO", T(shape: [attentionHeads * attentionHeadDim, modelDim], values: block.wO)),
+                (p + "norm2", T(shape: [modelDim], values: block.norm2)),
+                (p + "wMLPGate", T(shape: [modelDim, mlpDim], values: block.wMLPGate)),
+                (p + "wMLPUp", T(shape: [modelDim, mlpDim], values: block.wMLPUp)),
+                (p + "wMLPDown", T(shape: [mlpDim, modelDim], values: block.wMLPDown)),
+            ]
+        }
+        tensors += [
+            ("finalNorm", T(shape: [modelDim], values: finalNorm)),
+            ("wOut", T(shape: [modelDim, outputDim], values: wOut)),
+            ("bOut", T(shape: [outputDim], values: bOut)),
+        ]
+        try SafeTensors.write(tensors, metadata: metadata, to: url)
     }
 
     public static func load(from url: URL) throws -> HawkWeights {
-        let data = try Data(contentsOf: url)
-        return try JSONDecoder().decode(HawkWeights.self, from: data)
+        let (tensors, metadata) = try SafeTensors.read(from: url)
+        func size(_ key: String) throws -> Int {
+            guard let text = metadata[key], let value = Int(text) else {
+                throw SafeTensors.Failure.badHeader
+            }
+            return value
+        }
+        func values(_ name: String) throws -> [Float] {
+            guard let tensor = tensors[name] else {
+                throw SafeTensors.Failure.badShape(name)
+            }
+            return tensor.values
+        }
+        var layers: [HawkLayerWeights] = []
+        var i = 0
+        while i < (try size("numLayers")) {
+            let p = "layers.\(i)."
+            layers.append(HawkLayerWeights(
+                norm1: try values(p + "norm1"), wGate: try values(p + "wGate"), wX: try values(p + "wX"),
+                convW: try values(p + "convW"), convB: try values(p + "convB"), wA: try values(p + "wA"), bA: try values(p + "bA"),
+                wI: try values(p + "wI"), bI: try values(p + "bI"), lambda: try values(p + "lambda"), wO: try values(p + "wO"),
+                norm2: try values(p + "norm2"), wMLPGate: try values(p + "wMLPGate"), wMLPUp: try values(p + "wMLPUp"),
+                wMLPDown: try values(p + "wMLPDown")))
+            i += 1
+        }
+        var attention: [HawkAttentionLayerWeights] = []
+        var j = 0
+        while j < (try size("attentionBlocks")) {
+            let p = "attention.\(j)."
+            attention.append(HawkAttentionLayerWeights(
+                after: try size(p + "after"), norm1: try values(p + "norm1"), wQ: try values(p + "wQ"), wK: try values(p + "wK"),
+                wV: try values(p + "wV"), wO: try values(p + "wO"), norm2: try values(p + "norm2"),
+                wMLPGate: try values(p + "wMLPGate"), wMLPUp: try values(p + "wMLPUp"), wMLPDown: try values(p + "wMLPDown")))
+            j += 1
+        }
+        return HawkWeights(
+            inputDim: try size("inputDim"), modelDim: try size("modelDim"), rnnDim: try size("rnnDim"), mlpDim: try size("mlpDim"),
+            heads: try size("heads"), convWidth: try size("convWidth"), convRight: try size("convRight"),
+            outputDim: try size("outputDim"), wIn: try values("wIn"), bIn: try values("bIn"), layers: layers,
+            finalNorm: try values("finalNorm"), wOut: try values("wOut"), bOut: try values("bOut"),
+            vocabularyCharacters: metadata["vocabularyCharacters"], attention: attention,
+            attentionHeads: try size("attentionHeads"), attentionWindow: try size("attentionWindow"))
     }
 }
 
 /// Weights of one Hawk layer.
-public struct HawkLayerWeights: Sendable, Codable, Equatable {
+public struct HawkLayerWeights: Sendable, Equatable {
     public let norm1: [Float]       // [modelDim]
     public let wGate: [Float]       // [modelDim, rnnDim] GeLU branch
     public let wX: [Float]          // [modelDim, rnnDim] recurrent branch
@@ -249,7 +321,7 @@ public struct HawkLayerWeights: Sendable, Codable, Equatable {
 
 /// Weights of one Griffin-style local attention block (RMSNorm → multi-query attention over the last
 /// `attentionWindow` frames with rotary positions → residual, then RMSNorm → gated MLP → residual).
-public struct HawkAttentionLayerWeights: Sendable, Codable, Equatable {
+public struct HawkAttentionLayerWeights: Sendable, Equatable {
     /// Index of the recurrent layer this block follows.
     public let after: Int
     public let norm1: [Float]       // [modelDim]

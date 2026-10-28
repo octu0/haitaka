@@ -176,18 +176,6 @@ final class HawkTests: XCTestCase {
         }
     }
 
-    /// Weights saved without attention still load, with no attention blocks.
-    func testWeightsWithoutAttentionStillDecode() throws {
-        let weights = smallNetwork(convRight: 1).exportWeights()
-        var json = try JSONSerialization.jsonObject(with: try JSONEncoder().encode(weights)) as! [String: Any]
-        json.removeValue(forKey: "attention")
-        json.removeValue(forKey: "attentionHeads")
-        json.removeValue(forKey: "attentionWindow")
-        let decoded = try JSONDecoder().decode(HawkWeights.self, from: try JSONSerialization.data(withJSONObject: json))
-        XCTAssertEqual(decoded, weights)
-        XCTAssertTrue(decoded.attention.isEmpty)
-    }
-
     /// In a padded batch, frames past a sequence's length enter the lookahead convolution as zeros, as in the CPU flush.
     func testFrameCountsMaskMatchesSingleSequence() {
         let net = smallNetwork(convRight: 2)
@@ -205,7 +193,7 @@ final class HawkTests: XCTestCase {
         let net = smallNetwork(convRight: 1)
         let weights = net.exportWeights()
         XCTAssertEqual(weights.parameterCount, net.parameters().flattened().reduce(0) { $0 + $1.1.size })
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("hawk_roundtrip_\(UUID().uuidString).json")
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("hawk_roundtrip_\(UUID().uuidString).safetensors")
         try weights.save(to: url)
         let loaded = try HawkWeights.load(from: url)
         XCTAssertEqual(loaded, weights)

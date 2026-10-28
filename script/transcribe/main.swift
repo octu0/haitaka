@@ -59,7 +59,7 @@ while argIdx < args.count {
 }
 
 if wavPath.isEmpty || weightsPath.isEmpty {
-    print("Usage: transcribe -i <audio.wav> -w <weights.json> [-d <dictionary text>] [--kana-lm <kana text>] [--chunk-seconds N] [--max-seconds N] [--raw]")
+    print("Usage: transcribe -i <audio.wav> -w <weights.safetensors> [-d <dictionary text>] [--kana-lm <kana text>] [--chunk-seconds N] [--max-seconds N] [--raw]")
     exit(1)
 }
 

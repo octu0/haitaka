@@ -319,7 +319,7 @@ while ep <= epochs {
     print("  Epoch [\(ep)/\(epochs)] - loss: \(String(format: "%.4f", lossSum / Float(max(1, batches.count)))) (time: \(String(format: "%.0f", CFAbsoluteTimeGetCurrent() - epStart)) s, prefetch wait \(String(format: "%.0f", waitSeconds)) s)")
     var path = exportPath
     if ep < epochs {
-        path = exportPath + ".ep\(ep).json"
+        path = (exportPath as NSString).deletingPathExtension + ".ep\(ep).safetensors"
     }
     do {
         try network.exportWeights().save(to: URL(fileURLWithPath: path))

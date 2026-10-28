@@ -71,7 +71,7 @@ while argIdx < args.count {
         print("""
         Live microphone transcription
 
-          mictrans -w <weights.json> [-d <dictionary text>] [options]
+          mictrans -w <weights.safetensors> [-d <dictionary text>] [options]
 
         Options:
           --mic-list         List input devices and exit
@@ -242,7 +242,7 @@ if listMicrophones {
 }
 
 if weightsPath.isEmpty {
-    print("Usage: mictrans -w <weights.json> [-d <dictionary text>] [--kana-lm <kana text>] [--mic <index>]  (see --help)")
+    print("Usage: mictrans -w <weights.safetensors> [-d <dictionary text>] [--kana-lm <kana text>] [--mic <index>]  (see --help)")
     exit(1)
 }
 
