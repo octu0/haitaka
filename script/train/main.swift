@@ -438,20 +438,27 @@ if 0 < epochs {
     // Activation memory grows with utterances × padded frames × width, so batches are capped by that product.
     let widthRatio = Double(mlxNetwork.modelDim) / Double(HawkShape.defaultModelDim)
     let frameBudget = Int(Double(batchSize * Defaults.fullBatchFrames) / widthRatio)
-    var batchGroups: [[Int]] = []
-    var current: [Int] = []
-    for idx in lengthSortedIndices {
-        let padded = ((dataset.frameCount(at: idx) + 31) / 32) * 32
-        let fits = (current.count + 1) * padded <= frameBudget
-        if current.isEmpty != true && (current.count == batchSize || fits != true) {
-            batchGroups.append(current)
-            current = []
+    func batches(_ order: [Int]) -> [[Int]] {
+        var groups: [[Int]] = []
+        var current: [Int] = []
+        var maxFrames = 0
+        for idx in order {
+            maxFrames = max(maxFrames, dataset.frameCount(at: idx))
+            let padded = ((maxFrames + 31) / 32) * 32
+            let fits = (current.count + 1) * padded <= frameBudget
+            if current.isEmpty != true && (current.count == batchSize || fits != true) {
+                groups.append(current)
+                current = []
+                maxFrames = dataset.frameCount(at: idx)
+            }
+            current.append(idx)
         }
-        current.append(idx)
+        if current.isEmpty != true {
+            groups.append(current)
+        }
+        return groups
     }
-    if current.isEmpty != true {
-        batchGroups.append(current)
-    }
+    var batchGroups = batches(lengthSortedIndices)
     let fullBatches = batchGroups.filter { $0.count == batchSize }.count
     let smallest = batchGroups.map { $0.count }.min() ?? 0
     print("  batches: \(batchGroups.count) (\(fullBatches) of \(batchSize), smallest \(smallest) for the longest utterances)")
@@ -530,6 +537,10 @@ if 0 < epochs {
     while ep <= epochs {
         let epStartTime = CFAbsoluteTimeGetCurrent()
         augmenter.epochSalt = UInt64(ep)
+        if 1 < ep {
+            let jittered = feasibleIndices.map { idx in (key: dataset.frameCount(at: idx) + Int(batchOrder.next() % 17) - 8, idx: idx) }
+            batchGroups = batches(jittered.sorted { a, b in a.key < b.key }.map { $0.idx })
+        }
         batchGroups.shuffle(using: &batchOrder)
         groupBucketsWithinWindows(&batchGroups, window: Defaults.bucketRunWindow)
         var curLR = scheduler.learningRate(step: globalStep + 1, totalSteps: scheduleSteps, warmupSteps: warmupSteps) * lrScale

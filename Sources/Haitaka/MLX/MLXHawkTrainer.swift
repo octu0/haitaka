@@ -21,6 +21,10 @@ public final class MLXHawkTrainer: @unchecked Sendable {
     public static let cacheLimitBytes = 24 << 30
     public static let minCacheLimitBytes = 6 << 30
 
+    /// Adam updates since the moments were last zeroed; ArrayLRAdam has no bias correction, so it is applied
+    /// to the learning rate here.
+    private var adamSteps = 0
+
     public init(network: MLXHawkNetwork, learningRate: Float) {
         self.network = network
         self.optimizer = ArrayLRAdam(learningRate: learningRate)
@@ -36,6 +40,7 @@ public final class MLXHawkTrainer: @unchecked Sendable {
     public func rollback(to weights: HawkWeights) {
         network.importWeights(from: weights)
         optimizer.resetState()
+        adamSteps = 0
         compiledSteps.removeAll()
         compiledClusterSteps.removeAll()
         eval(network, optimizer)
@@ -107,7 +112,10 @@ public final class MLXHawkTrainer: @unchecked Sendable {
                 stepFn = fn
             }
         }
-        let lossValues = stepFn([features] + targets.toArrays() + [optimizer.learningRate])
+        adamSteps += 1
+        let t = Float(adamSteps)
+        let lr = optimizer.learningRate * ((1.0 - pow(optimizer.betas.1, t)).squareRoot() / (1.0 - pow(optimizer.betas.0, t)))
+        let lossValues = stepFn([features] + targets.toArrays() + [lr])
         eval(network, optimizer, lossValues)
         lastGradientNorm = lossValues[1].item(Float.self)
         return lossValues[0].item(Float.self)
