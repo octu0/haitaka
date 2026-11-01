@@ -169,6 +169,33 @@ public struct KanjiConverter: Sendable {
         return result
     }
 
+    /// Rewrites number notation the tokenizer cannot read: thousands separators are dropped (3,000 → 3000), decimals become
+    /// 「点」 plus digit-by-digit kana (8.5 → 8点ご, read はってんご through counter sandhi), and 「%」 becomes 「パーセント」.
+    static func spellOutNumberNotation(_ text: String) -> String {
+        var result = text
+        let rules: [(String, (NSTextCheckingResult, NSString) -> String)] = [
+            ("(?<=\\d)[,，](?=\\d{3}(?!\\d))", { _, _ in "" }),
+            ("(?<![\\d.．])(\\d+)[.．](\\d+)(?![\\d.．])", { m, ns in
+                var r = ns.substring(with: m.range(at: 1)) + "点"
+                for v in digitValues(ns.substring(with: m.range(at: 2))) ?? [] {
+                    r += digitKana[v]
+                }
+                return r
+            }),
+            ("[%％]", { _, _ in "パーセント" }),
+        ]
+        for (pattern, replace) in rules {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else {
+                continue
+            }
+            let ns = result as NSString
+            for m in regex.matches(in: result, range: NSRange(location: 0, length: ns.length)).reversed() {
+                result = (result as NSString).replacingCharacters(in: m.range, with: replace(m, ns))
+            }
+        }
+        return result
+    }
+
     /// Removes bracketed laugh annotations containing 「笑」 (笑, 爆笑, 冷笑); they describe laughter and are not spoken as 「わらい」.
     /// Only contents up to 6 characters are removed, so long bracketed quotes remain.
     /// A bare 「w」 is kept because it is spoken as 「だぶりゅー」.
@@ -356,8 +383,9 @@ public struct KanjiConverter: Sendable {
             return []
         }
 
-        // Normalize stretch marks (〜 etc.), remove unspoken laugh annotations, and spell out 「痛ーい」-style stretches.
-        let cleanText = stretchedOkurigana(Self.removeLaughAnnotations(Self.normalizeProlongedMarks(text)))
+        // Normalize stretch marks (〜 etc.), remove unspoken laugh annotations, spell out 「痛ーい」-style stretches and
+        // number notation (3,000 / 8.5 / 50%).
+        let cleanText = stretchedOkurigana(Self.removeLaughAnnotations(Self.normalizeProlongedMarks(Self.spellOutNumberNotation(text))))
 
         let loc = Locale(identifier: "ja_JP") as CFLocale
         let nsText = cleanText as NSString

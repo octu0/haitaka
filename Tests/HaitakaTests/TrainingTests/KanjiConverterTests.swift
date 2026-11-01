@@ -56,6 +56,19 @@ final class KanjiConverterTests: XCTestCase {
         XCTAssertEqual(converter.convertToHiragana("２０億円"), "にじゅーおくえん")
     }
 
+    func testNumberNotation() {
+        let converter = KanjiConverter()
+        // Thousands separators, decimals and percent signs used to vanish from the reading.
+        XCTAssertEqual(converter.convertToHiragana("約3,000マイル"), "やくさんぜんまいる")
+        XCTAssertEqual(converter.convertToHiragana("2,400人"), "にせんよんひゃくにん")
+        XCTAssertEqual(converter.convertToHiragana("8.5キロ"), "はってんごきろ")
+        XCTAssertEqual(converter.convertToHiragana("3.14"), "さんてんいちよん")
+        XCTAssertEqual(converter.convertToHiragana("50%"), "ごじゅっぱーせんと")
+        XCTAssertEqual(converter.convertToHiragana("26％"), "にじゅーろくぱーせんと")
+        // Japanese commas between numbers stay punctuation.
+        XCTAssertEqual(converter.convertToHiragana("1、2、3"), "いち、に、さん")
+    }
+
     // MARK: - Long-vowel mark restoration and normalization
 
     func testCombiningMacronRestoration() {
