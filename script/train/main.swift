@@ -60,6 +60,7 @@ var batchSize = Defaults.batchSize
 var datasetPath = ""
 var englishDictPath = ""
 var noiseBankPath = ""
+var voiceBankPath = ""
 var dictTextPaths: [String] = []
 var kanaLMPath = ""
 var evalDumpPath = ""
@@ -84,6 +85,7 @@ while argIdx < args.count {
         print("  --import-weights <path>            Initial weights (eval only with -e 0)")
         print("  --english-dict <path>              English pronunciation dictionary (CMU format) [required]")
         print("  --noise-bank <jsonl>               Manifest of noise clips mixed in during training")
+        print("  --voice-bank <jsonl>               Manifest of read-aloud bot voices laid over utterances (left out of the labels)")
         print("  --dict-text <path>                 Text added only to the kana-kanji dictionary (.txt/.srt or a directory; repeatable)")
         print("  --kana-lm <path>                   Kana text, one sentence per line (kanalm output). Fused into the eval CTC beam search as an n-gram LM")
         print("  --eval-dump <jsonl>                Write per-utterance eval results")
@@ -130,6 +132,11 @@ while argIdx < args.count {
     case "--noise-bank":
         if (argIdx + 1) < args.count {
             noiseBankPath = args[argIdx + 1]
+            argIdx += 1
+        }
+    case "--voice-bank":
+        if (argIdx + 1) < args.count {
+            voiceBankPath = args[argIdx + 1]
             argIdx += 1
         }
     case "--dict-text":
@@ -196,12 +203,23 @@ if noiseBankPath.isEmpty != true {
         exit(1)
     }
     noiseBank = bank
-    print("noise bank: \(noiseBankPath) (\(bank.count) clips, \(String(format: "%.1f", bank.totalSeconds / 60.0)) min; probability \(NoiseBank.probability), SNR \(NoiseBank.snrRange.lowerBound)-\(NoiseBank.snrRange.upperBound) dB)")
+    print("noise bank: \(noiseBankPath) (\(bank.count) clips, \(String(format: "%.1f", bank.totalSeconds / 60.0)) min; probability \(bank.probability), SNR \(bank.snrRange.lowerBound)-\(bank.snrRange.upperBound) dB)")
+}
+var voiceBank: NoiseBank? = nil
+if voiceBankPath.isEmpty != true {
+    guard let clips = try? NoiseBank.loadClips(manifestPath: voiceBankPath), clips.isEmpty != true else {
+        print("error: cannot read voice bank \(voiceBankPath)")
+        exit(1)
+    }
+    let bank = NoiseBank.voice(clips: clips)
+    voiceBank = bank
+    print("voice bank: \(voiceBankPath) (\(bank.count) clips, \(String(format: "%.1f", bank.totalSeconds / 60.0)) min; probability \(bank.probability), SNR \(bank.snrRange.lowerBound)-\(bank.snrRange.upperBound) dB, placed once)")
 }
 let augmenter = FeatureAugmenter(
     speed: augmentOptions.contains("speed"),
     specAugment: augmentOptions.contains("spec"),
-    noiseBank: noiseBank
+    noiseBank: noiseBank,
+    voiceBank: voiceBank
 )
 if augmentOptions.isEmpty != true {
     print("augmentation: \(augmentOptions.sorted().joined(separator: ", ")) (speed \(FeatureAugmenter.speedRange.lowerBound)-\(FeatureAugmenter.speedRange.upperBound)x / time masks \(FeatureAugmenter.timeMasks) x <= \(FeatureAugmenter.maxTimeMaskFrames) frames / frequency masks \(FeatureAugmenter.frequencyMasks) x <= \(FeatureAugmenter.maxFrequencyMaskBands) bands)")

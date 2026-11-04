@@ -18,14 +18,17 @@ public final class FeatureAugmenter: @unchecked Sendable {
     public let speed: Bool
     public let specAugment: Bool
     public let noiseBank: NoiseBank?
+    /// Read-aloud bot voices laid over the utterance after the background noise (`NoiseBank.voice`).
+    public let voiceBank: NoiseBank?
     /// Random choices are seeded by the utterance path and this value, so a run is reproducible while the
     /// training loop still gives every utterance a different augmentation each epoch by changing the salt.
     public var epochSalt: UInt64 = 0
 
-    public init(speed: Bool, specAugment: Bool, noiseBank: NoiseBank? = nil) {
+    public init(speed: Bool, specAugment: Bool, noiseBank: NoiseBank? = nil, voiceBank: NoiseBank? = nil) {
         self.speed = speed
         self.specAugment = specAugment
         self.noiseBank = noiseBank
+        self.voiceBank = voiceBank
     }
 
     /// FNV-1a hash of the path: the per-utterance part of the augmentation seed.
@@ -40,7 +43,7 @@ public final class FeatureAugmenter: @unchecked Sendable {
 
     /// nil when no PCM augmentation is enabled, so callers can skip the hook.
     public var pcmTransform: ((String, [Float]) -> [Float])? {
-        if speed != true && noiseBank == nil {
+        if speed != true && noiseBank == nil && voiceBank == nil {
             return nil
         }
         return { path, pcm in self.transformPCM(path: path, pcm) }
@@ -64,6 +67,9 @@ public final class FeatureAugmenter: @unchecked Sendable {
             out = Self.resample(out, speed: factor)
         }
         if let bank = noiseBank {
+            out = bank.mix(out, using: &rng)
+        }
+        if let bank = voiceBank {
             out = bank.mix(out, using: &rng)
         }
         return out

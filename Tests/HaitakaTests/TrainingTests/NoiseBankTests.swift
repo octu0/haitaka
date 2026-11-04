@@ -75,13 +75,51 @@ final class NoiseBankTests: XCTestCase {
             if 1e-6 < residualRMS {
                 mixedCount += 1
                 let snr = 20.0 * log10(NoiseBank.rms(speech) / residualRMS)
-                XCTAssertGreaterThanOrEqual(snr, NoiseBank.snrRange.lowerBound - 0.3)
-                XCTAssertLessThanOrEqual(snr, NoiseBank.snrRange.upperBound + 0.3)
+                XCTAssertGreaterThanOrEqual(snr, bank.snrRange.lowerBound - 0.3)
+                XCTAssertLessThanOrEqual(snr, bank.snrRange.upperBound + 0.3)
             }
             trial += 1
         }
         // Mixing probability is 0.5, so some of the 40 trials pass through unchanged.
         XCTAssertGreaterThan(mixedCount, 5)
         XCTAssertLessThan(mixedCount, 35)
+    }
+
+    func testOverlayAddsVoiceOnceAtItsOwnLevel() {
+        let speech = [Float](repeating: 0.1, count: 10)
+        let voice: [Float] = [1.0, -1.0, 1.0, -1.0]
+        // At 0 dB the voice's own RMS (1.0) is scaled to the speech RMS (0.1).
+        let mixed = NoiseBank.overlay(speech: speech, voice: voice, start: 3, snrDB: 0.0)
+        let expected: [Float] = [0.1, 0.1, 0.1, 0.2, 0.0, 0.2, 0.0, 0.1, 0.1, 0.1]
+        var i = 0
+        while i < expected.count {
+            XCTAssertEqual(mixed[i], expected[i], accuracy: 1e-5)
+            i += 1
+        }
+    }
+
+    func testOverlayCutsVoiceAtBothEnds() {
+        let speech = [Float](repeating: 0.1, count: 4)
+        let voice: [Float] = [1.0, -1.0, 1.0, -1.0]
+        let head = NoiseBank.overlay(speech: speech, voice: voice, start: -3, snrDB: 0.0)
+        XCTAssertEqual(head[0], 0.0, accuracy: 1e-5)
+        XCTAssertEqual(head[1], 0.1, accuracy: 1e-5)
+        let tail = NoiseBank.overlay(speech: speech, voice: voice, start: 3, snrDB: 0.0)
+        XCTAssertEqual(tail[2], 0.1, accuracy: 1e-5)
+        XCTAssertEqual(tail[3], 0.2, accuracy: 1e-5)
+    }
+
+    func testVoiceBankUsesVoiceSettings() {
+        let bank = NoiseBank.voice(clips: [tone(count: 4000, amplitude: 0.5, period: 41)])
+        XCTAssertEqual(bank.probability, NoiseBank.voiceProbability)
+        XCTAssertEqual(bank.snrRange, NoiseBank.voiceSNRRange)
+        XCTAssertEqual(bank.placement, .once)
+        let speech = tone(count: 16000, amplitude: 0.2, period: 100)
+        var rng = SystemRandomNumberGenerator()
+        var trial = 0
+        while trial < 20 {
+            XCTAssertEqual(bank.mix(speech, using: &rng).count, speech.count)
+            trial += 1
+        }
     }
 }
