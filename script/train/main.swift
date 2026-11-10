@@ -5,7 +5,9 @@ import MLX
 import Darwin
 #endif
 
+#if canImport(Darwin)
 setbuf(stdout, nil)
+#endif
 
 print("==================================================")
 print("=== haitaka train / eval ===")
@@ -45,11 +47,13 @@ enum Defaults {
 }
 
 func performanceCoreCount() -> Int {
+    #if canImport(Darwin)
     var count: Int32 = 0
     var size = MemoryLayout<Int32>.size
     if sysctlbyname("hw.perflevel0.logicalcpu", &count, &size, nil, 0) == 0 && 0 < count {
         return Int(count)
     }
+    #endif
     return ProcessInfo.processInfo.activeProcessorCount
 }
 
@@ -694,6 +698,14 @@ guard let model = network else {
     print("error: no weights to evaluate (-e 0 requires --import-weights)")
     exit(1)
 }
+let gpuEvalNetwork: MLXHawkNetwork?
+if MLXHawkNetwork.isGPUAvailable {
+    let net = MLXHawkNetwork(weights: model.weights)
+    eval(net)
+    gpuEvalNetwork = net
+} else {
+    gpuEvalNetwork = nil
+}
 
 if let expPath = exportWeightsPath {
     do {
@@ -851,10 +863,14 @@ let evalBuffer = EvalBuffer(count: evalPairs.count)
 let evalWorkers = max(1, numWorkers)
 print("eval targets: seen set \(trainEvalTarget) + unseen set \(rawPairs.count - sampleLimit)")
 let evalStartTime = Date()
+final class EvalFeaturesBox: @unchecked Sendable {
+    var items: [[[Float]]?]
+    init(count: Int) {
+        self.items = [[[Float]]?](repeating: nil, count: count)
+    }
+}
+let evalFeaturesBox = EvalFeaturesBox(count: evalPairs.count)
 DispatchQueue.concurrentPerform(iterations: evalWorkers) { worker in
-    let converter = KanjiConverter(english: englishDict)
-    let ctcDecoder = CTCDecoder(vocabulary: kanaVocabulary, languageModel: kanaLanguageModel)
-    let kanjiDecoder = KanaKanjiDecoder(dictionary: kanaKanjiDict)
     var idx = worker
     while idx < evalPairs.count {
         let pair = evalPairs[idx]
@@ -863,8 +879,56 @@ DispatchQueue.concurrentPerform(iterations: evalWorkers) { worker in
             continue
         }
         let pcm16k = SpeechDataset.resampleTo16k(pcmData: wavData.pcmData, sampleRate: wavData.sampleRate)
-        let features = SpeechDataset.extractFeaturesFromPCM(pcmData: pcm16k)
-        let kana = ctcDecoder.decode(logProbs: model.logProbs(features: features)).text
+        evalFeaturesBox.items[idx] = SpeechDataset.extractFeaturesFromPCM(pcmData: pcm16k)
+    }
+}
+final class EvalLogProbsBox: @unchecked Sendable {
+    var items: [[[Float]]?]
+    init(count: Int) {
+        self.items = [[[Float]]?](repeating: nil, count: count)
+    }
+}
+let evalLogProbsBox = EvalLogProbsBox(count: evalPairs.count)
+if let gpuNet = gpuEvalNetwork {
+    let evalBatchSize = max(1, batchSize)
+    let validEvalIndices = (0..<evalPairs.count).filter { evalFeaturesBox.items[$0] != nil }.sorted {
+        (evalFeaturesBox.items[$0]?.count ?? 0) < (evalFeaturesBox.items[$1]?.count ?? 0)
+    }
+    var bStart = 0
+    while bStart < validEvalIndices.count {
+        let bEnd = min(bStart + evalBatchSize, validEvalIndices.count)
+        let slice = Array(validEvalIndices[bStart..<bEnd])
+        let batchFeats = slice.map { evalFeaturesBox.items[$0]! }
+        let batchLP = gpuNet.logProbsBatch(featuresBatch: batchFeats)
+        for (k, origIdx) in slice.enumerated() {
+            evalLogProbsBox.items[origIdx] = batchLP[k]
+        }
+        bStart = bEnd
+    }
+} else {
+    DispatchQueue.concurrentPerform(iterations: evalWorkers) { worker in
+        var idx = worker
+        while idx < evalPairs.count {
+            defer { idx += evalWorkers }
+            guard let feats = evalFeaturesBox.items[idx] else {
+                continue
+            }
+            evalLogProbsBox.items[idx] = model.logProbs(features: feats)
+        }
+    }
+}
+DispatchQueue.concurrentPerform(iterations: evalWorkers) { worker in
+    let converter = KanjiConverter(english: englishDict)
+    let ctcDecoder = CTCDecoder(vocabulary: kanaVocabulary, languageModel: kanaLanguageModel)
+    let kanjiDecoder = KanaKanjiDecoder(dictionary: kanaKanjiDict)
+    var idx = worker
+    while idx < evalPairs.count {
+        let pair = evalPairs[idx]
+        defer { idx += evalWorkers }
+        guard let logProbs = evalLogProbsBox.items[idx] else {
+            continue
+        }
+        let kana = ctcDecoder.decode(logProbs: logProbs).text
         let kanji = kanjiDecoder.decode(kanaText: kana)
         let targetKana = converter.convertToHiragana(pair.text)
         let goldKanji = kanjiDecoder.decode(kanaText: targetKana)
@@ -897,7 +961,7 @@ DispatchQueue.concurrentPerform(iterations: evalWorkers) { worker in
         )
     }
 }
-print(String(format: "eval time: %.1f s (%d workers)", Date().timeIntervalSince(evalStartTime), evalWorkers))
+print(String(format: "eval time: %.1f s (%@ + %d CPU workers)", Date().timeIntervalSince(evalStartTime), gpuEvalNetwork != nil ? "GPU acoustic" : "CPU acoustic", evalWorkers))
 
 let allEval = evalBuffer.results.compactMap { $0 }
 let trainResults = allEval.filter { $0.isTrain }
@@ -1052,7 +1116,12 @@ if 0 < rawPairs.count {
     var totalFrames = 0
     var benchLogProbs: [[[Float]]] = []
     for feats in benchFeatures {
-        let logProbs = model.logProbs(features: feats)
+        let logProbs: [[Float]]
+        if let gpuNet = gpuEvalNetwork {
+            logProbs = gpuNet.logProbs(features: feats)
+        } else {
+            logProbs = model.logProbs(features: feats)
+        }
         totalFrames += logProbs.count
         benchLogProbs.append(logProbs)
     }

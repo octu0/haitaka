@@ -63,7 +63,14 @@ public struct LPC: Sendable {
                 j += 1
             }
             
-            let ki = (autoCorr[i] - s) / e
+            var ki = (autoCorr[i] - s) / e
+            if !ki.isFinite {
+                ki = 0.0
+            } else if ki > 0.999999 {
+                ki = 0.999999
+            } else if ki < -0.999999 {
+                ki = -0.999999
+            }
             a[i] = ki
             
             j = 1

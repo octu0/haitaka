@@ -29,7 +29,7 @@ public final class MLXHawkTrainer: @unchecked Sendable {
         self.network = network
         self.optimizer = ArrayLRAdam(learningRate: learningRate)
         let scaled = Self.cacheLimitBytes / max(1, network.modelDim / HawkShape.defaultModelDim)
-        MLX.GPU.set(cacheLimit: max(Self.minCacheLimitBytes, scaled))
+        MLX.Memory.cacheLimit = max(Self.minCacheLimitBytes, scaled)
     }
 
     public func updateLearningRate(_ lr: Float) {

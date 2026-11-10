@@ -387,8 +387,18 @@ public struct KanjiConverter: Sendable {
         // number notation (3,000 / 8.5 / 50%).
         let cleanText = stretchedOkurigana(Self.removeLaughAnnotations(Self.normalizeProlongedMarks(Self.spellOutNumberNotation(text))))
 
-        let loc = Locale(identifier: "ja_JP") as CFLocale
         let nsText = cleanText as NSString
+
+        struct RawTokenSpan {
+            let surface: String
+            let range: NSRange
+            let latinAttr: NSString?
+            let fallbackReading: String?
+        }
+
+        var rawSpans: [RawTokenSpan] = []
+        #if canImport(ObjectiveC)
+        let loc = Locale(identifier: "ja_JP") as CFLocale
         let tokenizer = CFStringTokenizerCreate(
             nil,
             cleanText as CFString,
@@ -396,20 +406,18 @@ public struct KanjiConverter: Sendable {
             kCFStringTokenizerUnitWordBoundary,
             loc
         )
-
-        struct RawTokenSpan {
-            let surface: String
-            let range: CFRange
-            let latinAttr: NSString?
-        }
-
-        var rawSpans: [RawTokenSpan] = []
         while CFStringTokenizerAdvanceToNextToken(tokenizer) != [] {
             let range = CFStringTokenizerGetCurrentTokenRange(tokenizer)
-            let surface = nsText.substring(with: NSRange(location: range.location, length: range.length))
+            let nsRange = NSRange(location: range.location, length: range.length)
+            let surface = nsText.substring(with: nsRange)
             let attr = CFStringTokenizerCopyCurrentTokenAttribute(tokenizer, kCFStringTokenizerAttributeLatinTranscription) as? NSString
-            rawSpans.append(RawTokenSpan(surface: surface, range: range, latinAttr: attr))
+            rawSpans.append(RawTokenSpan(surface: surface, range: nsRange, latinAttr: attr, fallbackReading: nil))
         }
+        #else
+        for item in Self.linuxTokenize(cleanText) {
+            rawSpans.append(RawTokenSpan(surface: item.surface, range: item.range, latinAttr: nil, fallbackReading: item.reading))
+        }
+        #endif
 
         // Join hyphenated English words split by the tokenizer ("Wi" + "-" + "Fi" -> "Wi-Fi").
         var mergedSpans: [RawTokenSpan] = []
@@ -427,11 +435,11 @@ public struct KanjiConverter: Sendable {
                     hyphenSpan.range.location + hyphenSpan.range.length == nextSpan.range.location
                 if isContiguousHyphen && Self.isAlphabetToken(currentSpan.surface) && Self.isAlphabetToken(nextSpan.surface) {
                     let combinedSurface = "\(currentSpan.surface)-\(nextSpan.surface)"
-                    let combinedRange = CFRangeMake(
-                        currentSpan.range.location,
-                        currentSpan.range.length + hyphenSpan.range.length + nextSpan.range.length
+                    let combinedRange = NSRange(
+                        location: currentSpan.range.location,
+                        length: currentSpan.range.length + hyphenSpan.range.length + nextSpan.range.length
                     )
-                    currentSpan = RawTokenSpan(surface: combinedSurface, range: combinedRange, latinAttr: nil)
+                    currentSpan = RawTokenSpan(surface: combinedSurface, range: combinedRange, latinAttr: nil, fallbackReading: nil)
                     spanIdx += 2
                 } else {
                     break
@@ -441,7 +449,7 @@ public struct KanjiConverter: Sendable {
         }
 
         // The tokenizer skips punctuation, so the marks are picked up from the gaps between tokens.
-        func appendPunctuation(from start: CFIndex, to end: CFIndex) {
+        func appendPunctuation(from start: Int, to end: Int) {
             if end <= start {
                 return
             }
@@ -453,7 +461,7 @@ public struct KanjiConverter: Sendable {
         }
 
         var tokens: [Token] = []
-        var consumedEnd: CFIndex = 0
+        var consumedEnd: Int = 0
         var mIdx = 0
         while mIdx < mergedSpans.count {
             let span = mergedSpans[mIdx]
@@ -482,6 +490,7 @@ public struct KanjiConverter: Sendable {
             }
 
             var reading = ""
+            #if canImport(ObjectiveC)
             // Katakana is already phonetic; the tokenizer's Latin transcription would turn エイ into ē.
             var latinAttr = span.latinAttr
             if Self.isKatakanaWord(surface) {
@@ -498,6 +507,15 @@ public struct KanjiConverter: Sendable {
             case .none:
                 reading = normalizeKana(surface)
             }
+            #else
+            if Self.isKatakanaWord(surface) {
+                reading = normalizeKana(surface)
+            } else if let fb = span.fallbackReading {
+                reading = normalizeKana(fb)
+            } else {
+                reading = normalizeKana(surface)
+            }
+            #endif
 
             tokens.append(Token(surface: surface, reading: kanaOnly(Self.pronunciation(surface: surface, reading: reading))))
         }
@@ -505,6 +523,205 @@ public struct KanjiConverter: Sendable {
         appendPunctuation(from: consumedEnd, to: nsText.length)
         return Self.applyReadingOverrides(tokens)
     }
+
+    #if !canImport(ObjectiveC)
+    static let linuxMorphemeTable: [(surface: String, reading: String)] = {
+        var dict: [String: String] = [
+            // Phrases & multi-kanji words
+            "お母さん": "おかあさん", "お父さん": "おとうさん", "お兄さん": "おにいさん", "お姉さん": "おねえさん",
+            "皆さん": "みなさん", "皆様": "みなさま", "一昨日": "おととい", "一昨年": "おととし", "一日中": "いちにちじゅう",
+            "世界中": "せかいじゅう", "日本中": "にほんじゅう", "思い出す": "おもいだす",
+            "人工": "じんこう", "知能": "ちのう", "技術": "ぎじゅつ", "進歩": "しんぽ",
+            "東京": "とうきょう", "先生": "せんせい", "映画": "えいが", "英語": "えいご", "衣装": "いしょう",
+            "大きい": "おおきい", "空気": "くうき", "鼻血": "はなぢ", "作業": "さぎょう", "価格": "かかく",
+            "日本": "にほん", "明日": "あした", "木曜": "もくよう", "日曜": "にちよう", "月曜": "げつよう",
+            "火曜": "かよう", "水曜": "すいよう", "金曜": "きんよう", "土曜": "どよう",
+            "外国": "がいこく", "天気": "てんき", "多摩": "たま", "時計": "とけい", "週間": "しゅうかん",
+            "位置": "いち", "確認": "かくにん", "駆除": "くじょ", "今日": "きょう", "晴天": "せいてん",
+            "漢字": "かんじ", "通知": "つうち", "全部": "ぜんぶ", "二行目": "にぎょうめ", "甲板": "かんぱん",
+            "銀杏": "ぎんなん", "無視": "むし",
+            // Verbs & adjectives with okurigana
+            "使って": "つかって", "使う": "つかう", "撮って": "とって", "見てる": "みてる", "見る": "みる",
+            "潜って": "もぐって", "深く": "ふかく", "深い": "ふかい", "痛い": "いたい", "凄い": "すごい",
+            "高い": "たかい", "良い": "よい", "言う": "いう", "言い": "いい", "思う": "おもう", "買う": "かう",
+            "飲む": "のむ", "行く": "いく", "続く": "つづく", "出す": "だす", "炊く": "たく",
+            "作り": "つくり", "造り": "つくり", "好き": "すき", "通り": "とおり", "起き": "おき", "来た": "きた",
+            "得る": "える",
+            // Single kanji & counters
+            "氷": "こおり", "水": "みず", "私": "わたし", "皆": "みな", "雲": "くも", "下": "もと",
+            "米": "べー", "他": "た", "数": "すう", "川": "かわ", "腕": "うで", "頃": "ころ",
+            "兄": "あに", "姉": "あね", "彼": "かれ", "君": "くん", "点": "てん", "約": "やく",
+            "年": "ねん", "月": "がつ", "日": "ひ", "時": "じ", "分": "ふん", "本": "ほん",
+            "回": "かい", "杯": "はい", "匹": "ひき", "歩": "ほ", "冊": "さつ", "円": "えん",
+            "万": "まん", "億": "おく", "兆": "ちょう", "千": "せん", "百": "ひゃく", "十": "じゅう",
+            "一": "いち", "二": "に", "三": "さん", "四": "よん", "五": "ご", "六": "ろく",
+            "七": "なな", "八": "はち", "九": "きゅう", "何": "なん", "今": "いま",
+            // Common hiragana morphemes & particles
+            "か月": "かげつ", "おじいさん": "おじいさん", "おばあさん": "おばあさん", "ありがとう": "ありがとう",
+            "よろしく": "よろしく", "いこう": "いこう", "このまま": "このまま",
+            "てるんかい": "てるんかい", "やられた": "やられた", "それな": "それな", "たかし": "たかし",
+            "ちゃん": "ちゃん", "さん": "さん", "ました": "ました", "してる": "してる", "ている": "ている",
+            "して": "して", "した": "した", "する": "する", "ない": "ない", "いる": "いる", "です": "です",
+            "これ": "これ", "その": "その", "この": "この", "こと": "こと", "でも": "でも",
+            "から": "から", "まで": "まで", "より": "より", "そう": "そう", "いう": "いう", "はい": "はい", "ねえ": "ねえ",
+            "は": "は", "が": "が", "を": "を", "に": "に", "へ": "へ", "と": "と", "で": "で",
+            "の": "の", "も": "も", "や": "や", "か": "か", "ね": "ね", "よ": "よ", "だ": "だ", "つ": "つ",
+        ]
+        for (k, v) in readingOverrides where dict[k] == nil {
+            dict[k] = v
+        }
+        return dict.map { ($0.key, $0.value) }.sorted { a, b in
+            if a.0.count != b.0.count {
+                return a.0.count > b.0.count
+            }
+            return a.0 < b.0
+        }
+    }()
+
+    static func linuxTokenize(_ text: String) -> [(surface: String, range: NSRange, reading: String?)] {
+        let ns = text as NSString
+        let len = ns.length
+        var out: [(surface: String, range: NSRange, reading: String?)] = []
+        var pos = 0
+
+        func scalarAt(_ idx: Int) -> Unicode.Scalar? {
+            guard idx < len else { return nil }
+            let u = ns.character(at: idx)
+            return Unicode.Scalar(u)
+        }
+
+        func isDigitScalar(_ s: Unicode.Scalar) -> Bool {
+            return (0x30...0x39).contains(s.value) || (0xFF10...0xFF19).contains(s.value)
+        }
+
+        func isLatinScalar(_ s: Unicode.Scalar) -> Bool {
+            let v = s.value
+            return (0x41...0x5A).contains(v) || (0x61...0x7A).contains(v) ||
+                   (0xFF21...0xFF3A).contains(v) || (0xFF41...0xFF5A).contains(v) || v == 0x27
+        }
+
+        func isHiraganaScalar(_ s: Unicode.Scalar) -> Bool {
+            return (0x3041...0x3096).contains(s.value)
+        }
+
+        while pos < len {
+            guard let s = scalarAt(pos) else {
+                pos += 1
+                continue
+            }
+            let ch = Character(s)
+
+            // Skip whitespace, brackets, quotes, and punctuation (picked up from gaps by appendPunctuation).
+            if s.properties.isWhitespace || "()（）「」『』[]【】\"'".contains(ch) ||
+               punctuation.contains(ch) || [0x3001, 0xFF0C, 0x2C, 0x3002, 0xFF0E, 0x2E, 0xFF1F, 0x3F, 0xFF01, 0x21].contains(s.value) {
+                pos += 1
+                continue
+            }
+
+            // 1. Contiguous digits
+            if isDigitScalar(s) {
+                let start = pos
+                while pos < len, let next = scalarAt(pos), isDigitScalar(next) {
+                    pos += 1
+                }
+                let r = NSRange(location: start, length: pos - start)
+                out.append((ns.substring(with: r), r, nil))
+                continue
+            }
+
+            // 2. Contiguous Latin letters
+            if isLatinScalar(s) {
+                let start = pos
+                while pos < len, let next = scalarAt(pos), isLatinScalar(next) {
+                    pos += 1
+                }
+                let r = NSRange(location: start, length: pos - start)
+                out.append((ns.substring(with: r), r, nil))
+                continue
+            }
+
+            // 3. Standalone hyphen / prolonged mark (e.g. between Latin tokens or at start)
+            let oneChar = ns.substring(with: NSRange(location: pos, length: 1))
+            if isHyphenSpan(oneChar) {
+                let r = NSRange(location: pos, length: 1)
+                out.append((oneChar, r, nil))
+                pos += 1
+                continue
+            }
+
+            // 4. Katakana word (including internal ー)
+            if isKatakana(s) {
+                let start = pos
+                while pos < len, let next = scalarAt(pos), (isKatakana(next) || next.value == 0x30FC || isProlongedMark(next.value)) {
+                    pos += 1
+                }
+                let r = NSRange(location: start, length: pos - start)
+                let surf = ns.substring(with: r)
+                out.append((surf, r, surf))
+                continue
+            }
+
+            // 5. Longest match in linuxMorphemeTable
+            var matched = false
+            for entry in linuxMorphemeTable {
+                let mLen = (entry.surface as NSString).length
+                if pos + mLen <= len {
+                    let candRange = NSRange(location: pos, length: mLen)
+                    if ns.substring(with: candRange) == entry.surface {
+                        // Avoid splitting inside a prolonged hiragana run like 「あーあ」 or 「らーめん」 or 「いたーい」
+                        if pos + mLen < len, let nextS = scalarAt(pos + mLen), nextS.value == 0x30FC, isHiraganaScalar(s) {
+                            continue
+                        }
+                        out.append((entry.surface, candRange, entry.reading))
+                        pos += mLen
+                        matched = true
+                        break
+                    }
+                }
+            }
+            if matched {
+                continue
+            }
+
+            // 6. Special contextual kanji: 「人」 is にん after a numeral or kanji/katakana, ひと otherwise.
+            if oneChar == "人" {
+                let prevSurf = out.last?.surface ?? ""
+                let isCompound = isNumeralSurface(prevSurf) || startsWithKanjiOrKatakana(prevSurf)
+                let r = NSRange(location: pos, length: 1)
+                out.append(("人", r, isCompound ? "にん" : "ひと"))
+                pos += 1
+                continue
+            }
+
+            // 7. Contiguous Hiragana (including ー) up to the next non-hiragana or particle boundary
+            if isHiraganaScalar(s) {
+                let start = pos
+                pos += 1
+                while pos < len, let next = scalarAt(pos), (isHiraganaScalar(next) || next.value == 0x30FC || isProlongedMark(next.value)) {
+                    // Stop if a known morpheme/particle starts here and we didn't just see ー
+                    if next.value != 0x30FC {
+                        let rem = ns.substring(from: pos)
+                        if linuxMorphemeTable.contains(where: { rem.hasPrefix($0.surface) && $0.surface.count >= 2 }) {
+                            break
+                        }
+                    }
+                    pos += 1
+                }
+                let r = NSRange(location: start, length: pos - start)
+                let surf = ns.substring(with: r)
+                out.append((surf, r, surf))
+                continue
+            }
+
+            // 8. Single fallback character
+            let r = NSRange(location: pos, length: 1)
+            let surf = ns.substring(with: r)
+            out.append((surf, r, surf))
+            pos += 1
+        }
+        return out
+    }
+    #endif
 
     /// Single-morpheme surfaces whose tokenizer reading is replaced by the spoken reading. Values are orthographic readings passed through `pronunciation`.
     static let readingOverrides: [String: String] = [

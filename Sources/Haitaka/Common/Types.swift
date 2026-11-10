@@ -1,5 +1,19 @@
 import Foundation
 
+#if !canImport(ObjectiveC)
+public typealias CFAbsoluteTime = Double
+
+@inline(__always)
+public func CFAbsoluteTimeGetCurrent() -> CFAbsoluteTime {
+    return Date().timeIntervalSinceReferenceDate
+}
+
+@inline(__always)
+public func autoreleasepool<Result>(invoking body: () throws -> Result) rethrows -> Result {
+    return try body()
+}
+#endif
+
 public struct PitchResult: Sendable, Equatable {
     public let f0: Float
     public let hnr: Float

@@ -4,7 +4,9 @@ import Haitaka
 import Darwin
 #endif
 
+#if canImport(Darwin)
 setbuf(stdout, nil)
+#endif
 
 private func getResidentMemoryBytes() -> UInt64 {
     #if canImport(Darwin)

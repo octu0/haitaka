@@ -216,7 +216,7 @@ func runListen(options: [String: [String]], positional: [String]) throws {
         fail("kanatext listen: training needs one train manifest")
     }
     Device.setDefault(device: .gpu)
-    MLX.GPU.set(cacheLimit: ListenDefaults.cacheLimitBytes)
+    MLX.Memory.cacheLimit = ListenDefaults.cacheLimitBytes
     MLXRandom.seed(Defaults.seed)
 
     let weights = try HawkWeights.load(from: URL(fileURLWithPath: acousticPath))
@@ -347,14 +347,14 @@ func runListen(options: [String: [String]], positional: [String]) throws {
             windowSum += value
             if step % ListenDefaults.logEvery == 0 {
                 print(String(format: "  step %d: loss %.4f (%.0f s into the epoch, peak %d MB)", step, windowSum / Float(ListenDefaults.logEvery),
-                             CFAbsoluteTimeGetCurrent() - start, MLX.GPU.peakMemory >> 20))
+                             CFAbsoluteTimeGetCurrent() - start, MLX.Memory.peakMemory >> 20))
                 windowSum = 0.0
             }
             group.wait()
             bi += 1
         }
         print(String(format: "epoch %d/%d loss %.4f (%.0f s, peak %d MB)", ep, epochs, lossSum / Float(batches.count),
-                     CFAbsoluteTimeGetCurrent() - start, MLX.GPU.peakMemory >> 20))
+                     CFAbsoluteTimeGetCurrent() - start, MLX.Memory.peakMemory >> 20))
         let selection = try evaluateAll(outDir + "/ep\(ep)")
         try saveModel(model, vocabulary: vocabulary, to: outDir + "/ep\(ep)")
         if 0.0 < selection && selection < best {

@@ -1,9 +1,13 @@
+#if canImport(AVFoundation) && canImport(CoreAudio)
 @preconcurrency import AVFoundation
 import CoreAudio
+#endif
 import Foundation
 import Haitaka
 
+#if canImport(Darwin)
 setbuf(stdout, nil)
+#endif
 
 // Live transcription of microphone input.
 //
@@ -94,6 +98,7 @@ while argIdx < args.count {
 
 // MARK: - Input device enumeration
 
+#if canImport(AVFoundation) && canImport(CoreAudio)
 /// A CoreAudio input device.
 struct AudioInputDevice {
     let id: AudioDeviceID
@@ -219,8 +224,10 @@ func defaultInputDeviceId() -> AudioDeviceID? {
         initial: AudioDeviceID(0)
     )
 }
+#endif
 
 if listMicrophones {
+    #if canImport(AVFoundation) && canImport(CoreAudio)
     let devices = listInputDevices()
     if devices.isEmpty {
         print("No input devices found.")
@@ -239,6 +246,10 @@ if listMicrophones {
     print("")
     print("Select one with --mic <index> or --mic <part of the name>.")
     exit(0)
+    #else
+    print("No input devices found (CoreAudio is macOS-only; use --wav <audio.wav>).")
+    exit(1)
+    #endif
 }
 
 if weightsPath.isEmpty {
@@ -256,14 +267,16 @@ if weightsPath.isEmpty {
 /// cannot be touched from another thread.
 final class ShutdownController: @unchecked Sendable {
     private let lock = NSLock()
+    #if canImport(AVFoundation) && canImport(CoreAudio)
     private var session: MicSession? = nil
-    private var seen = false
 
     func attach(_ session: MicSession) {
         lock.lock()
         self.session = session
         lock.unlock()
     }
+    #endif
+    private var seen = false
 
     func handle() {
         lock.lock()
@@ -274,12 +287,16 @@ final class ShutdownController: @unchecked Sendable {
             exit(130)
         }
         seen = true
+        #if canImport(AVFoundation) && canImport(CoreAudio)
         let current = session
+        #endif
         lock.unlock()
 
         print("")
         print("Exiting...")
+        #if canImport(AVFoundation) && canImport(CoreAudio)
         current?.finish()
+        #endif
         exit(0)
     }
 }
@@ -836,6 +853,7 @@ if wavInputPath.isEmpty != true {
 
 // MARK: - Microphone input
 
+#if canImport(AVFoundation) && canImport(CoreAudio)
 // Request microphone permission first. The first time, the system shows a dialog; without waiting
 // here the program appears to hang silently during engine setup.
 func requestMicrophoneAccess() -> Bool {
@@ -1138,3 +1156,7 @@ do {
 }
 
 RunLoop.main.run()
+#else
+print("Error: live microphone capture requires macOS CoreAudio; pass --wav <audio.wav> on Linux.")
+exit(1)
+#endif

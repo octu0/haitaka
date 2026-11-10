@@ -1,7 +1,13 @@
 import Foundation
 import Haitaka
+import MLX
+#if canImport(Darwin)
+import Darwin
+#endif
 
+#if canImport(Darwin)
 setbuf(stdout, nil)
+#endif
 
 var wavPath = ""
 var weightsPath = ""
@@ -10,6 +16,7 @@ var kanaLMPath = ""
 var chunkSeconds = 0.0
 var maxSeconds = 0.0
 var usePostProcess = true
+var forceCPU = false
 
 var argIdx = 1
 let args = CommandLine.arguments
@@ -52,6 +59,8 @@ while argIdx < args.count {
         }
     case "--raw", "--no-postprocess":
         usePostProcess = false
+    case "--cpu":
+        forceCPU = true
     default:
         break
     }
@@ -65,6 +74,7 @@ if wavPath.isEmpty || weightsPath.isEmpty {
 
 /// Resident memory size in MB.
 func residentMemoryMB() -> Double {
+    #if canImport(Darwin)
     var info = mach_task_basic_info()
     var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size / MemoryLayout<natural_t>.size)
     let result = withUnsafeMutablePointer(to: &info) { infoPtr in
@@ -76,6 +86,15 @@ func residentMemoryMB() -> Double {
         return 0.0
     }
     return Double(info.resident_size) / (1024.0 * 1024.0)
+    #else
+    if let statm = try? String(contentsOfFile: "/proc/self/statm", encoding: .utf8) {
+        let parts = statm.split(separator: " ")
+        if parts.count > 1, let rssPages = UInt64(parts[1]) {
+            return Double(rssPages * 4096) / (1024.0 * 1024.0)
+        }
+    }
+    return 0.0
+    #endif
 }
 
 func report(_ label: String) {
@@ -154,9 +173,21 @@ if chunkSeconds <= 0.0 {
 }
 print("Chunks: \(segments.count)" + chunkDescription)
 
-let network = HawkNetwork(weights: weights)
+let useGPU = !forceCPU && MLXHawkNetwork.isGPUAvailable
+let gpuNetwork: MLXHawkNetwork?
+let cpuNetwork: HawkNetwork?
+if useGPU {
+    let net = MLXHawkNetwork(weights: weights)
+    eval(net)
+    gpuNetwork = net
+    cpuNetwork = nil
+    report("after model load (GPU)")
+} else {
+    gpuNetwork = nil
+    cpuNetwork = HawkNetwork(weights: weights)
+    report("after model load (CPU)")
+}
 let ctcDecoder = CTCDecoder(vocabulary: kanaVocabulary, languageModel: kanaLanguageModel)
-report("after model load")
 
 var kanaParts: [String] = []
 var totalFrames = 0
@@ -169,7 +200,13 @@ while segIdx < segments.count {
     let features = SpeechDataset.extractFeaturesFromPCM(pcmData: Array(pcm[seg.start..<(seg.start + seg.count)]))
     totalFrames += features.count
     if 0 < features.count {
-        kanaParts.append(ctcDecoder.decode(logProbs: network.logProbs(features: features)).text)
+        let lp: [[Float]]
+        if let gpuNet = gpuNetwork {
+            lp = gpuNet.logProbs(features: features)
+        } else {
+            lp = cpuNetwork!.logProbs(features: features)
+        }
+        kanaParts.append(ctcDecoder.decode(logProbs: lp).text)
     } else {
         kanaParts.append("")
     }

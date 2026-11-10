@@ -4,7 +4,9 @@ import MLX
 import MLXNN
 import MLXOptimizers
 
+#if canImport(Darwin)
 setbuf(stdout, nil)
+#endif
 
 // Streaming kana-to-text converter: pronunciation kana (the acoustic model's targets) → text with kanji, Latin letters
 // and punctuation, unit by unit (a unit ends at a punctuation mark).
@@ -340,7 +342,13 @@ case "prepare":
     }
     let converter = KanjiConverter(english: english)
     let lines = readLines(positional[0])
-    var out = [String](repeating: "", count: lines.count)
+    final class PrepareBuffer: @unchecked Sendable {
+        var out: [String]
+        init(count: Int) {
+            self.out = [String](repeating: "", count: count)
+        }
+    }
+    let prepBuf = PrepareBuffer(count: lines.count)
     DispatchQueue.concurrentPerform(iterations: 16) { worker in
         var i = worker
         while i < lines.count {
@@ -348,13 +356,13 @@ case "prepare":
             if f.count == 2 {
                 let kana = converter.convertToHiragana(f[1])
                 if kana.isEmpty != true {
-                    out[i] = "\(f[0])\t\(kana)\t\(f[1])"
+                    prepBuf.out[i] = "\(f[0])\t\(kana)\t\(f[1])"
                 }
             }
             i += 16
         }
     }
-    let kept = out.filter { $0.isEmpty != true }
+    let kept = prepBuf.out.filter { $0.isEmpty != true }
     try kept.joined(separator: "\n").appending("\n").write(toFile: positional[1], atomically: true, encoding: .utf8)
     print("\(kept.count) of \(lines.count) lines → \(positional[1])")
 
@@ -363,7 +371,7 @@ case "train":
         fail("usage: kanatext train --out <dir> [-e epochs] [--eval <prepared.tsv>]... <prepared train.tsv>")
     }
     Device.setDefault(device: .gpu)
-    MLX.GPU.set(cacheLimit: Defaults.cacheLimitBytes)
+    MLX.Memory.cacheLimit = Defaults.cacheLimitBytes
     MLXRandom.seed(Defaults.seed)
     let epochs = Int(options["-e"]?.first ?? "") ?? Defaults.epochs
     let pairs = readPairs(positional[0])
@@ -410,7 +418,7 @@ case "train":
             lossSum += loss[0].item(Float.self)
         }
         print(String(format: "epoch %d/%d loss %.4f (%.0f s, peak %d MB)", ep, epochs, lossSum / Float(batches.count),
-                     CFAbsoluteTimeGetCurrent() - start, MLX.GPU.peakMemory >> 20))
+                     CFAbsoluteTimeGetCurrent() - start, MLX.Memory.peakMemory >> 20))
         var selection = 0.0
         for set in evalSets {
             let (cer, outputs, cut) = evaluate(model, vocabulary, set.pairs, kana: set.pairs.map { $0.kana })
@@ -437,7 +445,7 @@ case "eval":
         fail("usage: kanatext eval --model <dir> [--kana-from <eval dump.jsonl>] <prepared.tsv>...")
     }
     Device.setDefault(device: .gpu)
-    MLX.GPU.set(cacheLimit: Defaults.cacheLimitBytes)
+    MLX.Memory.cacheLimit = Defaults.cacheLimitBytes
     let (model, vocabulary) = try loadModel(from: modelDir)
     var predicted: [String: String] = [:]
     for dump in options["--kana-from"] ?? [] {

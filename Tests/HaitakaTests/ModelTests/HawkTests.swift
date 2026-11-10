@@ -81,7 +81,7 @@ final class HawkTests: XCTestCase {
         let t = MLXArray(0..<frames).reshaped([frames, 1])
         let s = MLXArray(0..<frames).reshaped([1, frames])
         let allowed = logicalAnd(s .<= t, t - s .< window)
-        let p = softmax(MLX.where(allowed, scores, MLXArray(Float(-1e9))), axis: -1)
+        let p = softmax(MLX.which(allowed, scores, MLXArray(Float(-1e9))), axis: -1)
         return matmul(p, v.expandedDimensions(axis: 1)).transposed(0, 2, 1, 3)
     }
 
@@ -155,6 +155,26 @@ final class HawkTests: XCTestCase {
         let got = cpu.logProbs(features: features, chunkFrames: chunkFrames)
         XCTAssertEqual(got.count, frames)
         assertClose(MLXArray(got.flatMap { $0 }, [1, frames, 7]), expected, 2e-4)
+
+        let gpuGot = net.logProbs(features: features)
+        XCTAssertEqual(gpuGot.count, frames)
+        assertClose(MLXArray(gpuGot.flatMap { $0 }, [1, frames, 7]), expected, 2e-4)
+    }
+
+    func testGPUBatchedInferenceMatchesSingleAndCPU() {
+        let net = MLXHawkNetwork(inputDim: 12, modelDim: 16, rnnDim: 24, mlpDim: 32, heads: 3, convWidth: 4, convRight: 2,
+                                 numLayers: 2, outputDim: 7, attentionAfter: [0, 1], attentionHeads: 2, attentionWindow: 9)
+        let seq1 = makeFeatures(frames: 19, dim: 12, phase: 0)
+        let seq2 = makeFeatures(frames: 35, dim: 12, phase: 4)
+        let batched = net.logProbsBatch(featuresBatch: [seq1, seq2])
+        XCTAssertEqual(batched.count, 2)
+        XCTAssertEqual(batched[0].count, 19)
+        XCTAssertEqual(batched[1].count, 35)
+        let cpu = HawkNetwork(weights: net.exportWeights())
+        let cpu1 = cpu.logProbs(features: seq1)
+        let cpu2 = cpu.logProbs(features: seq2)
+        assertClose(MLXArray(batched[0].flatMap { $0 }, [19, 7]), MLXArray(cpu1.flatMap { $0 }, [19, 7]), 2e-4)
+        assertClose(MLXArray(batched[1].flatMap { $0 }, [35, 7]), MLXArray(cpu2.flatMap { $0 }, [35, 7]), 2e-4)
     }
 
     /// Local attention blocks: chunked CPU inference with cached keys matches the MLX forward pass, with and

@@ -1,7 +1,9 @@
 import Foundation
 import Haitaka
 
+#if canImport(Darwin)
 setbuf(stdout, nil)
+#endif
 
 // Evaluates kana-kanji conversion alone by feeding the reference kana; no acoustic model is needed.
 

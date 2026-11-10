@@ -5,6 +5,7 @@ import MLXNN
 /// Linear recurrence h_t = a_t h_{t-1} + x_t (h_{-1} = 0) over [B, T, R], one Metal thread per channel.
 /// The backward pass is a reverse-time scan kernel, so graph size does not grow with sequence length.
 public enum MLXLinearScan {
+    #if os(macOS)
     static let forwardKernel = MLXFast.metalKernel(
         name: "hawk_linear_scan_forward",
         inputNames: ["a", "x"],
@@ -83,10 +84,35 @@ public enum MLXLinearScan {
             )
         }
     }
+    #endif
+
+    /// Parallel associative scan over T in O(log T) steps using standard MLX operations (CUDA / CPU compatible).
+    public static func associativeScan(_ aIn: MLXArray, _ xIn: MLXArray) -> MLXArray {
+        var a = aIn.asType(.float32)
+        var h = xIn.asType(.float32)
+        let T = a.dim(1)
+        var stride = 1
+        while stride < T {
+            let aHi = a[0..., stride..<T, 0...]
+            let aLo = a[0..., 0..<(T - stride), 0...]
+            let hHi = h[0..., stride..<T, 0...]
+            let hLo = h[0..., 0..<(T - stride), 0...]
+            let hUpdated = aHi * hLo + hHi
+            let aUpdated = aHi * aLo
+            h = concatenated([h[0..., 0..<stride, 0...], hUpdated], axis: 1)
+            a = concatenated([a[0..., 0..<stride, 0...], aUpdated], axis: 1)
+            stride *= 2
+        }
+        return h
+    }
 
     /// a, x: [B, T, R] (float32). Returns h: [B, T, R].
     public static func scan(_ a: MLXArray, _ x: MLXArray) -> MLXArray {
+        #if os(macOS)
         return function([a.asType(.float32), x.asType(.float32)])[0]
+        #else
+        return associativeScan(a, x)
+        #endif
     }
 }
 
@@ -94,6 +120,7 @@ public enum MLXLinearScan {
 /// p = softmax_o(q[b, t, h] · k[b, t-o]). q: [B, T, H, D] (already scaled), k, v: [B, T, D].
 /// One SIMD group per (b, t, h) row; each lane holds every 32nd channel and every 32nd offset's score.
 public enum MLXLocalAttention {
+    #if os(macOS)
     static let forwardKernel = MLXFast.metalKernel(
         name: "hawk_local_attention_forward",
         inputNames: ["q", "k", "v"],
@@ -314,10 +341,44 @@ public enum MLXLocalAttention {
         functions[window] = f
         return f
     }
+    #endif
+
+    /// Causal local multi-query attention using standard MLX operations (CUDA / CPU compatible).
+    public static func attendStandard(_ qIn: MLXArray, _ kIn: MLXArray, _ vIn: MLXArray, window: Int) -> MLXArray {
+        let q = qIn.asType(.float32)
+        let k = kIn.asType(.float32)
+        let v = vIn.asType(.float32)
+        let T = q.dim(1)
+        if T == 0 {
+            return q
+        }
+        // q: [B, T, H, D] -> [B, H, T, D]
+        let qBHTD = q.transposed(0, 2, 1, 3)
+        // k: [B, T, D] -> [B, 1, D, T]
+        let kB1DT = k.expandedDimensions(axis: 1).transposed(0, 1, 3, 2)
+        // scores: [B, H, T, T]
+        let scores = matmul(qBHTD, kB1DT)
+        let idx = MLXArray(Array(0..<Int32(T)))
+        let rowIdx = idx.reshaped([1, 1, T, 1])
+        let colIdx = idx.reshaped([1, 1, 1, T])
+        let diff = rowIdx - colIdx
+        let valid = (diff .>= Int32(0)) .&& (diff .< Int32(window))
+        let masked = which(valid, scores, MLXArray(Float(-1e9)))
+        let probs = softmax(masked, axis: -1)
+        // v: [B, T, D] -> [B, 1, T, D]
+        let vB1TD = v.expandedDimensions(axis: 1)
+        // out: [B, H, T, D] -> [B, T, H, D]
+        let outBHTD = matmul(probs, vB1TD)
+        return outBHTD.transposed(0, 2, 1, 3)
+    }
 
     /// q: [B, T, H, D], k, v: [B, T, D] (float32). Returns [B, T, H, D].
     public static func attend(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray, window: Int) -> MLXArray {
+        #if os(macOS)
         return function(window: window)([q.asType(.float32), k.asType(.float32), v.asType(.float32)])[0]
+        #else
+        return attendStandard(q, k, v, window: window)
+        #endif
     }
 }
 
@@ -619,6 +680,102 @@ public final class MLXHawkNetwork: Module, @unchecked Sendable {
     /// end are zeroed at the convolution input, matching CPU inference with lookahead.
     public func callAsFunction(_ features: MLXArray, frameCounts: MLXArray? = nil) -> MLXArray {
         return encoded(features, frameCounts: frameCounts).logits
+    }
+
+    /// Returns true if an MLX GPU backend (Metal on macOS, CUDA on Linux) is available at runtime.
+    public static var isGPUAvailable: Bool {
+        Device.defaultDevice().deviceType == .gpu
+    }
+
+    /// GPU inference: log-probabilities [T][outputDim] for a single utterance.
+    public func logProbs(features: [[Float]]) -> [[Float]] {
+        let frames = features.count
+        if frames == 0 {
+            return []
+        }
+        var flat = [Float](repeating: 0.0, count: frames * inputDim)
+        var t = 0
+        while t < frames {
+            let row = features[t]
+            let base = t * inputDim
+            var d = 0
+            while d < min(inputDim, row.count) {
+                flat[base + d] = row[d]
+                d += 1
+            }
+            t += 1
+        }
+        let x = MLXArray(flat, [1, frames, inputDim])
+        let counts = MLXArray([Int32(frames)])
+        let lp = logSoftmax(self(x, frameCounts: counts), axis: -1)
+        eval(lp)
+        let values = lp.asArray(Float.self)
+        var result: [[Float]] = []
+        result.reserveCapacity(frames)
+        t = 0
+        while t < frames {
+            result.append(Array(values[(t * outputDim)..<((t + 1) * outputDim)]))
+            t += 1
+        }
+        return result
+    }
+
+    /// GPU batched inference: log-probabilities [B][T_b][outputDim] for multiple utterances.
+    public func logProbsBatch(featuresBatch: [[[Float]]]) -> [[[Float]]] {
+        if featuresBatch.isEmpty {
+            return []
+        }
+        var maxT = 0
+        for f in featuresBatch {
+            maxT = max(maxT, f.count)
+        }
+        if maxT == 0 {
+            return [[[Float]]](repeating: [], count: featuresBatch.count)
+        }
+        let paddedT = ((maxT + 31) / 32) * 32
+        let B = featuresBatch.count
+        var flat = [Float](repeating: 0.0, count: B * paddedT * inputDim)
+        var frameCounts = [Int32](repeating: 0, count: B)
+        var b = 0
+        while b < B {
+            let seq = featuresBatch[b]
+            frameCounts[b] = Int32(seq.count)
+            var t = 0
+            while t < seq.count {
+                let row = seq[t]
+                let offset = (b * paddedT + t) * inputDim
+                var d = 0
+                while d < min(inputDim, row.count) {
+                    flat[offset + d] = row[d]
+                    d += 1
+                }
+                t += 1
+            }
+            b += 1
+        }
+        let x = MLXArray(flat, [B, paddedT, inputDim])
+        let counts = MLXArray(frameCounts)
+        let lp = logSoftmax(self(x, frameCounts: counts), axis: -1)
+        eval(lp)
+        let values = lp.asArray(Float.self)
+        var results: [[[Float]]] = []
+        results.reserveCapacity(B)
+        b = 0
+        while b < B {
+            let frames = featuresBatch[b].count
+            var utt: [[Float]] = []
+            utt.reserveCapacity(frames)
+            let baseB = b * paddedT * outputDim
+            var t = 0
+            while t < frames {
+                let start = baseB + t * outputDim
+                utt.append(Array(values[start..<(start + outputDim)]))
+                t += 1
+            }
+            results.append(utt)
+            b += 1
+        }
+        return results
     }
 
     /// The normalized last-layer output [B, T, modelDim] (what the readout sees) and the logits [B, T, outputDim].

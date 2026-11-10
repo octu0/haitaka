@@ -1,4 +1,6 @@
+#if canImport(Accelerate)
 import Accelerate
+#endif
 import Foundation
 
 /// CPU inference for the Hawk acoustic model. Processes audio chunk by chunk, carrying the
@@ -220,6 +222,7 @@ public final class HawkNetwork: @unchecked Sendable {
                 let count = position - first + 1
                 let window = first - cacheStart
                 // scores [heads, count] = Q_t [heads, hd] · K_window^T
+                #if canImport(Accelerate)
                 cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, Int32(heads), Int32(count), Int32(hd),
                             scale, qp.baseAddress! + t * heads * hd, Int32(hd), kp.baseAddress! + window * hd, Int32(hd),
                             0.0, sp.baseAddress!, Int32(count))
@@ -242,6 +245,62 @@ public final class HawkNetwork: @unchecked Sendable {
                 cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, Int32(heads), Int32(hd), Int32(count),
                             1.0, sp.baseAddress!, Int32(count), vp.baseAddress! + window * hd, Int32(hd),
                             0.0, op.baseAddress! + t * heads * hd, Int32(hd))
+                #else
+                let qBase = qp.baseAddress! + t * heads * hd
+                let kBase = kp.baseAddress! + window * hd
+                let vBase = vp.baseAddress! + window * hd
+                let oBase = op.baseAddress! + t * heads * hd
+                var h = 0
+                while h < heads {
+                    let qRow = qBase + h * hd
+                    let sRow = sp.baseAddress! + h * count
+                    var peak = -Float.greatestFiniteMagnitude
+                    var j = 0
+                    while j < count {
+                        let kRow = kBase + j * hd
+                        var sum: Float = 0.0
+                        var d = 0
+                        while d < hd {
+                            sum += qRow[d] * kRow[d]
+                            d += 1
+                        }
+                        let s = sum * scale
+                        sRow[j] = s
+                        if peak < s {
+                            peak = s
+                        }
+                        j += 1
+                    }
+                    var total: Float = 0.0
+                    j = 0
+                    while j < count {
+                        let e = expf(sRow[j] - peak)
+                        sRow[j] = e
+                        total += e
+                        j += 1
+                    }
+                    let inv = 1.0 / total
+                    let oRow = oBase + h * hd
+                    var d = 0
+                    while d < hd {
+                        oRow[d] = 0.0
+                        d += 1
+                    }
+                    j = 0
+                    while j < count {
+                        let p = sRow[j] * inv
+                        sRow[j] = p
+                        let vRow = vBase + j * hd
+                        d = 0
+                        while d < hd {
+                            oRow[d] += p * vRow[d]
+                            d += 1
+                        }
+                        j += 1
+                    }
+                    h += 1
+                }
+                #endif
                 t += 1
             }
         }}}}}
@@ -436,8 +495,55 @@ public final class HawkNetwork: @unchecked Sendable {
 
     static func gemmRaw(_ a: UnsafePointer<Float>, _ lda: Int, _ b: UnsafePointer<Float>, _ ldb: Int,
                         _ c: UnsafeMutablePointer<Float>, _ ldc: Int, m: Int, n: Int, k: Int, beta: Float) {
+        #if canImport(Accelerate)
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, Int32(m), Int32(n), Int32(k),
                     1.0, a, Int32(lda), b, Int32(ldb), beta, c, Int32(ldc))
+        #else
+        var i = 0
+        while i < m {
+            let cRow = c + i * ldc
+            var j = 0
+            if beta == 0.0 {
+                let zero = SIMD8<Float>(repeating: 0.0)
+                while j + 8 <= n {
+                    store(zero, cRow + j)
+                    j += 8
+                }
+                while j < n {
+                    cRow[j] = 0.0
+                    j += 1
+                }
+            } else if beta != 1.0 {
+                let bVec = SIMD8<Float>(repeating: beta)
+                while j + 8 <= n {
+                    store(load(cRow + j) * bVec, cRow + j)
+                    j += 8
+                }
+                while j < n {
+                    cRow[j] *= beta
+                    j += 1
+                }
+            }
+            let aRow = a + i * lda
+            var p = 0
+            while p < k {
+                let aVal = aRow[p]
+                let aVec = SIMD8<Float>(repeating: aVal)
+                let bRow = b + p * ldb
+                j = 0
+                while j + 8 <= n {
+                    store(load(cRow + j) + aVec * load(bRow + j), cRow + j)
+                    j += 8
+                }
+                while j < n {
+                    cRow[j] += aVal * bRow[j]
+                    j += 1
+                }
+                p += 1
+            }
+            i += 1
+        }
+        #endif
     }
 
     static func rmsNorm(_ x: [Float], _ gain: [Float], _ out: inout [Float], frames: Int, width: Int) {

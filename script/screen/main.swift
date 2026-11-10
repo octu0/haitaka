@@ -1,7 +1,9 @@
 import Foundation
 import Haitaka
 
+#if canImport(Darwin)
 setbuf(stdout, nil)
+#endif
 
 // Measures the audio of a training manifest with DSP and writes the JSONL back with statistics.
 //
@@ -33,7 +35,7 @@ struct ScreenStats {
     var peak: Float = 0.0
 }
 
-struct ManifestEntry: Codable {
+struct ManifestEntry: Codable, Sendable {
     let path: String
     let text: String
 }
@@ -242,7 +244,7 @@ final class ResultBuffer: @unchecked Sendable {
     }
 }
 
-func formatStats(_ s: ScreenStats) -> String {
+@Sendable func formatStats(_ s: ScreenStats) -> String {
     return String(
         format: "\"dur\":%.2f,\"speech\":%.3f,\"lead\":%.2f,\"tail\":%.2f,\"cps\":%.2f,\"voiced\":%.3f,\"formant\":%.3f,\"snr\":%.1f,\"clip\":%.5f,\"peak\":%.3f",
         s.durationSeconds, s.speechRatio, s.leadSilenceSeconds, s.tailSilenceSeconds,
@@ -251,13 +253,16 @@ func formatStats(_ s: ScreenStats) -> String {
 }
 
 let startedAt = Date()
-let results = ResultBuffer(count: entries.count)
-let progressEvery = max(1, entries.count / 20)
-DispatchQueue.concurrentPerform(iterations: numWorkers) { worker in
+let entriesSnapshot = entries
+let rawLinesSnapshot = rawLines
+let workersCount = numWorkers
+let results = ResultBuffer(count: entriesSnapshot.count)
+let progressEvery = max(1, entriesSnapshot.count / 20)
+DispatchQueue.concurrentPerform(iterations: workersCount) { worker in
     let screener = Screener()
     var i = worker
-    while i < entries.count {
-        let entry = entries[i]
+    while i < entriesSnapshot.count {
+        let entry = entriesSnapshot[i]
         let statsLine: String
         switch screener.measure(path: entry.path, textLength: entry.text.count) {
         case .some(let s):
@@ -269,7 +274,7 @@ DispatchQueue.concurrentPerform(iterations: numWorkers) { worker in
             results.lock.unlock()
         }
         // Insert the statistics before the trailing "}" of the original line.
-        let raw = rawLines[i]
+        let raw = rawLinesSnapshot[i]
         if statsLine.isEmpty {
             results.lines[i] = nil
         } else {
@@ -278,9 +283,9 @@ DispatchQueue.concurrentPerform(iterations: numWorkers) { worker in
         }
         if (i % progressEvery) == 0 && worker == 0 {
             let elapsed = Date().timeIntervalSince(startedAt)
-            print(String(format: "  %d / %d (%.0f s)", i, entries.count, elapsed))
+            print(String(format: "  %d / %d (%.0f s)", i, entriesSnapshot.count, elapsed))
         }
-        i += numWorkers
+        i += workersCount
     }
 }
 

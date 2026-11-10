@@ -20,7 +20,7 @@ let package = Package(
         .executable(name: "benchmark", targets: ["benchmark"])
     ],
     dependencies: [
-        .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.21.0")
+        .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.33.0")
     ],
     targets: [
         .target(
@@ -43,8 +43,16 @@ let package = Package(
             dependencies: ["Haitaka", .product(name: "MLX", package: "mlx-swift")],
             path: "script/pretrain"
         ),
-        .executableTarget(name: "transcribe", dependencies: ["Haitaka"], path: "script/transcribe"),
-        .executableTarget(name: "mictrans", dependencies: ["Haitaka"], path: "Sources/mictrans"),
+        .executableTarget(
+            name: "transcribe",
+            dependencies: ["Haitaka", .product(name: "MLX", package: "mlx-swift")],
+            path: "script/transcribe"
+        ),
+        .executableTarget(
+            name: "mictrans",
+            dependencies: ["Haitaka", .product(name: "MLX", package: "mlx-swift")],
+            path: "Sources/mictrans"
+        ),
         .executableTarget(name: "stage2", dependencies: ["Haitaka"], path: "script/stage2"),
         .executableTarget(name: "kanalm", dependencies: ["Haitaka"], path: "script/kanalm"),
         .executableTarget(

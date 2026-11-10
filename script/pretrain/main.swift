@@ -11,7 +11,9 @@ import MLX
 //     pretrain -d <manifest.jsonl> --kmeans <codebook.json> --teacher <weights.json>
 //     pretrain -d <manifest.jsonl> --targets <codebook.json> --teacher <weights.json> -e <epochs> --export-weights <weights.json>
 
+#if canImport(Darwin)
 setvbuf(stdout, nil, _IOLBF, 0)
+#endif
 
 enum Defaults {
     /// Longer utterances are split into consecutive windows of this many frames (20.48 s).

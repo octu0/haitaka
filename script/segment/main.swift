@@ -1,7 +1,9 @@
 import Foundation
 import Haitaka
 
+#if canImport(Darwin)
 setbuf(stdout, nil)
+#endif
 
 // Cuts long audio into utterances, attaches transcript text to each, and writes a training manifest.
 //
