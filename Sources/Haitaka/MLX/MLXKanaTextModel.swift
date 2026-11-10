@@ -104,8 +104,32 @@ public struct KanaTextShape: Codable, Sendable {
     public var encoderAttentionAfter = [2, 5]
     public var attentionWindow = 64
     public var decoderLayers = 6
+    /// Reads kana through the encoder and attends to it (off when the decoder listens to the audio only).
+    public var kanaInput = true
+    /// Width of the acoustic model output the decoder also attends to; 0 when it does not listen.
+    public var audioDim = 0
 
     public init() {}
+
+    enum CodingKeys: String, CodingKey {
+        case modelDim, rnnDim, mlpDim, heads, convWidth, encoderLayers, encoderAttentionAfter, attentionWindow, decoderLayers
+        case kanaInput, audioDim
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        modelDim = try c.decode(Int.self, forKey: .modelDim)
+        rnnDim = try c.decode(Int.self, forKey: .rnnDim)
+        mlpDim = try c.decode(Int.self, forKey: .mlpDim)
+        heads = try c.decode(Int.self, forKey: .heads)
+        convWidth = try c.decode(Int.self, forKey: .convWidth)
+        encoderLayers = try c.decode(Int.self, forKey: .encoderLayers)
+        encoderAttentionAfter = try c.decode([Int].self, forKey: .encoderAttentionAfter)
+        attentionWindow = try c.decode(Int.self, forKey: .attentionWindow)
+        decoderLayers = try c.decode(Int.self, forKey: .decoderLayers)
+        kanaInput = try c.decodeIfPresent(Bool.self, forKey: .kanaInput) ?? true
+        audioDim = try c.decodeIfPresent(Int.self, forKey: .audioDim) ?? 0
+    }
 }
 
 /// Splits a line into units that end at punctuation, kana and text alike. Returns nil when the two sides do not
@@ -221,7 +245,8 @@ public enum KanaTextRepetition {
     }
 }
 
-/// Cross-attention from the decoder to the encoder outputs of the current unit. Pre-RMSNorm, residual.
+/// Cross-attention from the decoder to the encoder outputs of the current unit (or to the acoustic model's output
+/// frames, `memoryDim` wide). Pre-RMSNorm, residual. A zero output projection starts it as the identity.
 final class MLXKanaTextCrossAttention: Module, @unchecked Sendable {
     public var norm: MLXArray
     public var wQ: MLXArray
@@ -230,7 +255,7 @@ final class MLXKanaTextCrossAttention: Module, @unchecked Sendable {
     public var wO: MLXArray
     let heads: Int
 
-    init(dim: Int, heads: Int, residualScale: Float) {
+    init(dim: Int, memoryDim: Int, heads: Int, residualScale: Float, zeroOutput: Bool = false) {
         self.heads = heads
         func uniform(_ fanIn: Int, _ shape: [Int], scale: Float = 1.0) -> MLXArray {
             let bound = scale * sqrt(3.0 / Float(fanIn))
@@ -238,17 +263,21 @@ final class MLXKanaTextCrossAttention: Module, @unchecked Sendable {
         }
         norm = MLXArray.ones([dim])
         wQ = uniform(dim, [dim, dim])
-        wK = uniform(dim, [dim, dim])
-        wV = uniform(dim, [dim, dim])
-        wO = uniform(dim, [dim, dim], scale: residualScale)
+        wK = uniform(memoryDim, [memoryDim, dim])
+        wV = uniform(memoryDim, [memoryDim, dim])
+        if zeroOutput {
+            wO = MLXArray.zeros([dim, dim])
+        } else {
+            wO = uniform(dim, [dim, dim], scale: residualScale)
+        }
         super.init()
     }
 
-    /// memory [B, S, D] → keys and values [B, heads, S, D/heads].
+    /// memory [B, S, memoryDim] → keys and values [B, heads, S, dim/heads].
     func keysValues(_ memory: MLXArray) -> (MLXArray, MLXArray) {
         let b = memory.dim(0)
         let s = memory.dim(1)
-        let hd = memory.dim(2) / heads
+        let hd = wK.shape[1] / heads
         let k = matmul(memory, wK).reshaped([b, s, heads, hd]).transposed(0, 2, 1, 3)
         let v = matmul(memory, wV).reshaped([b, s, heads, hd]).transposed(0, 2, 1, 3)
         return (k, v)
@@ -302,6 +331,8 @@ extension MLXHawkLayer {
 /// targets) left to right; the decoder writes text one character per step and attends only to the encoder outputs of
 /// the current unit (kana up to a punctuation mark). Both carry their recurrent state across units, so context reaches
 /// back over the whole stream while memory stays constant. Each unit's text ends with `eos`, which also starts the next.
+/// With `audioDim`, each decoder layer also attends to the acoustic model's output frames of the unit (`listen`); with
+/// `kanaInput` off it attends to those frames only.
 public final class MLXKanaTextModel: Module, @unchecked Sendable {
     public let shape: KanaTextShape
     public var inputEmbedding: MLXArray
@@ -311,6 +342,7 @@ public final class MLXKanaTextModel: Module, @unchecked Sendable {
     public var encoderNorm: MLXArray
     var decoder: [MLXHawkLayer]
     var cross: [MLXKanaTextCrossAttention]
+    var listen: [MLXKanaTextCrossAttention]
     public var decoderNorm: MLXArray
     public var wOut: MLXArray
     public var bOut: MLXArray
@@ -324,17 +356,35 @@ public final class MLXKanaTextModel: Module, @unchecked Sendable {
             return MLXHawkLayer(modelDim: d, rnnDim: shape.rnnDim, mlpDim: shape.mlpDim, heads: shape.heads,
                                 convWidth: shape.convWidth, convRight: 0, numLayers: layers)
         }
-        let encoderBlocks = shape.encoderLayers + shape.encoderAttentionAfter.count
-        encoder = (0..<shape.encoderLayers).map { _ in hawk(encoderBlocks) }
-        encoderAttention = shape.encoderAttentionAfter.map { after in
+        var encoderLayers = 0
+        var encoderAttentionAfter: [Int] = []
+        if shape.kanaInput {
+            encoderLayers = shape.encoderLayers
+            encoderAttentionAfter = shape.encoderAttentionAfter
+        }
+        let encoderBlocks = encoderLayers + encoderAttentionAfter.count
+        encoder = (0..<encoderLayers).map { _ in hawk(encoderBlocks) }
+        encoderAttention = encoderAttentionAfter.map { after in
             MLXHawkAttentionLayer(after: after, modelDim: d, mlpDim: shape.mlpDim, heads: shape.heads,
                                   window: shape.attentionWindow, residualScale: 1.0 / sqrt(Float(2 * encoderBlocks)))
         }
         encoderNorm = MLXArray.ones([d])
         let decoderBlocks = 2 * shape.decoderLayers
         decoder = (0..<shape.decoderLayers).map { _ in hawk(decoderBlocks) }
-        cross = (0..<shape.decoderLayers).map { _ in
-            MLXKanaTextCrossAttention(dim: d, heads: shape.heads, residualScale: 1.0 / sqrt(Float(2 * decoderBlocks)))
+        var crossLayers = 0
+        if shape.kanaInput {
+            crossLayers = shape.decoderLayers
+        }
+        cross = (0..<crossLayers).map { _ in
+            MLXKanaTextCrossAttention(dim: d, memoryDim: d, heads: shape.heads, residualScale: 1.0 / sqrt(Float(2 * decoderBlocks)))
+        }
+        var listenLayers = 0
+        if 0 < shape.audioDim {
+            listenLayers = shape.decoderLayers
+        }
+        listen = (0..<listenLayers).map { _ in
+            MLXKanaTextCrossAttention(dim: d, memoryDim: shape.audioDim, heads: shape.heads,
+                                      residualScale: 1.0 / sqrt(Float(2 * decoderBlocks)), zeroOutput: true)
         }
         decoderNorm = MLXArray.ones([d])
         let bound = sqrt(3.0 / Float(d))
@@ -357,14 +407,22 @@ public final class MLXKanaTextModel: Module, @unchecked Sendable {
         return hawkRMSNorm(h, encoderNorm)
     }
 
-    /// Teacher-forced decoding: previous [B, T] → logits [B, T, V]. `mask` [B, 1, T, S] lets each step see its unit.
-    public func decode(_ previous: MLXArray, memory: MLXArray, mask: MLXArray) -> MLXArray {
+    /// Teacher-forced decoding: previous [B, T] → logits [B, T, V]. `mask` [B, 1, T, S] lets each step see its unit
+    /// of `memory`; `audioMask` [B, 1, T or 1, F] does the same for the acoustic frames `audio` [B, F, audioDim].
+    public func decode(_ previous: MLXArray, memory: MLXArray?, mask: MLXArray?, audio: MLXArray? = nil,
+                       audioMask: MLXArray? = nil) -> MLXArray {
         var h = outputEmbedding[previous]
         var i = 0
         while i < decoder.count {
             h = decoder[i](h, frameMask: nil)
-            let (k, v) = cross[i].keysValues(memory)
-            h = cross[i](h, keys: k, values: v, mask: mask)
+            if let memory, let mask, i < cross.count {
+                let (k, v) = cross[i].keysValues(memory)
+                h = cross[i](h, keys: k, values: v, mask: mask)
+            }
+            if let audio, let audioMask, i < listen.count {
+                let (k, v) = listen[i].keysValues(audio)
+                h = listen[i](h, keys: k, values: v, mask: audioMask)
+            }
             i += 1
         }
         return matmul(hawkRMSNorm(h, decoderNorm), wOut) + bOut
@@ -387,13 +445,21 @@ public final class MLXKanaTextModel: Module, @unchecked Sendable {
         }
     }
 
-    /// One decoder step: token [B] → logits [B, V]. `mask` [B, 1, 1, S] selects each row's current unit.
-    func step(_ token: MLXArray, states: inout [HawkStepState], keysValues: [(MLXArray, MLXArray)], mask: MLXArray) -> MLXArray {
+    /// One decoder step: token [B] → logits [B, V]. `mask` [B, 1, 1, S] selects each row's current unit; `audioMask`
+    /// [B, 1, 1, F] its acoustic frames.
+    func step(_ token: MLXArray, states: inout [HawkStepState], keysValues: [(MLXArray, MLXArray)], mask: MLXArray?,
+              audioKeysValues: [(MLXArray, MLXArray)] = [], audioMask: MLXArray? = nil) -> MLXArray {
         var h = outputEmbedding[token]
         var i = 0
         while i < decoder.count {
             h = decoder[i].step(h, state: &states[i])
-            h = cross[i](h.expandedDimensions(axis: 1), keys: keysValues[i].0, values: keysValues[i].1, mask: mask).squeezed(axis: 1)
+            if let mask, i < keysValues.count {
+                h = cross[i](h.expandedDimensions(axis: 1), keys: keysValues[i].0, values: keysValues[i].1, mask: mask).squeezed(axis: 1)
+            }
+            if let audioMask, i < audioKeysValues.count {
+                h = listen[i](h.expandedDimensions(axis: 1), keys: audioKeysValues[i].0, values: audioKeysValues[i].1,
+                              mask: audioMask).squeezed(axis: 1)
+            }
             i += 1
         }
         return matmul(hawkRMSNorm(h, decoderNorm), wOut) + bOut
@@ -469,5 +535,77 @@ public final class MLXKanaTextModel: Module, @unchecked Sendable {
             }
         }
         return (units: outputs, cut: cut)
+    }
+
+    /// Greedy decoding of one utterance per row, the state starting fresh. `source` [B, S] holds the recognized kana
+    /// (`sourceCounts` long) when the model reads kana; `audio` [B, F, audioDim] the acoustic frames (`frameCounts`
+    /// long) when it listens. Each row stops at `eos`, after `limits[r]` characters, or when its text ends in more
+    /// copies of a span than `allowed[r]` (the extra copies are dropped).
+    public func greedyUtterances(source: MLXArray?, sourceCounts: [Int], audio: MLXArray?, frameCounts: [Int],
+                                 limits: [Int], allowed: [Int]) -> (texts: [[Int]], cut: Int) {
+        let b = limits.count
+        var kv: [(MLXArray, MLXArray)] = []
+        var mask: MLXArray? = nil
+        if let source, shape.kanaInput {
+            let memory = encode(source)
+            kv = cross.map { $0.keysValues(memory) }
+            mask = Self.paddingMask(sourceCounts, width: source.dim(1))
+        }
+        var audioKV: [(MLXArray, MLXArray)] = []
+        var audioMask: MLXArray? = nil
+        if let audio, 0 < shape.audioDim {
+            audioKV = listen.map { $0.keysValues(audio) }
+            audioMask = Self.paddingMask(frameCounts, width: audio.dim(1))
+        }
+        for (k, v) in kv + audioKV {
+            eval(k, v)
+        }
+        var states = initialStates(b)
+        var outputs = [[Int]](repeating: [], count: b)
+        var done = limits.map { $0 <= 0 }
+        var cut = 0
+        var token = [Int32](repeating: Int32(KanaTextVocabulary.bos), count: b)
+        while done.contains(false) {
+            let logits = step(MLXArray(token), states: &states, keysValues: kv, mask: mask, audioKeysValues: audioKV,
+                              audioMask: audioMask)
+            let next = argMax(logits, axis: -1).asArray(Int32.self)
+            for state in states {
+                eval(state.h, state.conv)
+            }
+            var r = 0
+            while r < b {
+                if done[r] != true {
+                    if next[r] == Int32(KanaTextVocabulary.eos) || limits[r] <= outputs[r].count {
+                        done[r] = true
+                    } else {
+                        outputs[r].append(Int(next[r]))
+                        let repeated = KanaTextRepetition.tail(outputs[r], end: outputs[r].count)
+                        if allowed[r] < repeated.count {
+                            outputs[r].removeLast((repeated.count - 1) * repeated.period)
+                            cut += 1
+                            done[r] = true
+                        }
+                    }
+                    token[r] = next[r]
+                }
+                r += 1
+            }
+        }
+        return (texts: outputs, cut: cut)
+    }
+
+    /// Additive mask [B, 1, 1, width] that hides positions at or past each row's count.
+    public static func paddingMask(_ counts: [Int], width: Int) -> MLXArray {
+        var values = [Float](repeating: -1e9, count: counts.count * width)
+        var r = 0
+        while r < counts.count {
+            var p = 0
+            while p < min(max(1, counts[r]), width) {
+                values[r * width + p] = 0.0
+                p += 1
+            }
+            r += 1
+        }
+        return MLXArray(values, [counts.count, 1, 1, width])
     }
 }

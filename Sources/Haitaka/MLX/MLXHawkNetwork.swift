@@ -618,8 +618,13 @@ public final class MLXHawkNetwork: Module, @unchecked Sendable {
     /// features: [B, T, inputDim] → logits [B, T, outputDim]. With `frameCounts` [B], frames past each sequence
     /// end are zeroed at the convolution input, matching CPU inference with lookahead.
     public func callAsFunction(_ features: MLXArray, frameCounts: MLXArray? = nil) -> MLXArray {
-        let x = hidden(features, frameCounts: frameCounts, layerCount: layers.count)
-        return matmul(hawkRMSNorm(x, finalNorm), wOut) + bOut
+        return encoded(features, frameCounts: frameCounts).logits
+    }
+
+    /// The normalized last-layer output [B, T, modelDim] (what the readout sees) and the logits [B, T, outputDim].
+    public func encoded(_ features: MLXArray, frameCounts: MLXArray? = nil) -> (output: MLXArray, logits: MLXArray) {
+        let normed = hawkRMSNorm(hidden(features, frameCounts: frameCounts, layerCount: layers.count), finalNorm)
+        return (normed, matmul(normed, wOut) + bOut)
     }
 
     /// Residual stream [B, T, modelDim] after the first `layerCount` layers.

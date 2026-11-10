@@ -12,6 +12,7 @@ setbuf(stdout, nil)
 //   kanatext train --out <dir> [-e epochs] [--eval <prepared.tsv>]... <prepared train.tsv>
 //   kanatext eval --model <dir> [--kana-from <eval dump.jsonl>] <prepared.tsv>...  (per line, and per stream: lines in
 //     label order as one sequence). Writes label, text, per-line and per-stream output to <dir>/outputs_<name>.
+//   kanatext listen ...  the decoder that also attends to the acoustic model's output frames (Listen.swift)
 // Training reads consecutive lines of a stream as one sequence (up to `chunkKana` kana), so the recurrent state learns
 // to carry context across units. CER compares NFKC text without punctuation and spaces (`scoringForm`).
 
@@ -313,7 +314,7 @@ func printExamples(_ pairs: [Pair], _ outputs: [String], count: Int) {
 
 let args = Array(CommandLine.arguments.dropFirst())
 guard let command = args.first else {
-    fail("usage: kanatext prepare|train|eval ...")
+    fail("usage: kanatext prepare|train|eval|listen ...")
 }
 var options: [String: [String]] = [:]
 var positional: [String] = []
@@ -467,6 +468,9 @@ case "eval":
         }
         printExamples(pairs, outputs, count: Defaults.examples)
     }
+
+case "listen":
+    try runListen(options: options, positional: positional)
 
 default:
     fail("unknown command \(command)")
