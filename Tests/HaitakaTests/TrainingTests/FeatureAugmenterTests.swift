@@ -92,4 +92,27 @@ final class FeatureAugmenterTests: XCTestCase {
         XCTAssertNotNil(on.pcmTransform)
         XCTAssertNotNil(on.featureTransform)
     }
+
+    /// Batches are formed on the predicted perturbed length, so it must match the features of the perturbed audio.
+    func testPredictedFrameCountMatchesPerturbedFeatures() {
+        let augmenter = FeatureAugmenter(speed: true, specAugment: false)
+        var pcm = [Float](repeating: 0.0, count: 16000 * 3)
+        var i = 0
+        while i < pcm.count {
+            let t = Float(i)
+            pcm[i] = 0.1 * sin(t * 0.05) + 0.02 * sin(t * 0.31)
+            i += 1
+        }
+        let frames = SpeechDataset.extractFeaturesFromPCM(pcmData: pcm).count
+        var worst = 0
+        for epoch in 1...6 {
+            augmenter.epochSalt = UInt64(epoch)
+            for path in ["/a/x.wav", "/b/y.wav", "/c/z.wav"] {
+                let perturbed = SpeechDataset.extractFeaturesFromPCM(pcmData: augmenter.transformPCM(path: path, pcm)).count
+                worst = max(worst, abs(augmenter.frameCount(frames, path: path) - perturbed))
+            }
+        }
+        XCTAssertLessThanOrEqual(worst, 1)
+        XCTAssertEqual(FeatureAugmenter(speed: false, specAugment: false).frameCount(frames, path: "/a/x.wav"), frames)
+    }
 }

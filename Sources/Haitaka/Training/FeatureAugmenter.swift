@@ -59,6 +59,25 @@ public final class FeatureAugmenter: @unchecked Sendable {
         }
     }
 
+    /// The speed factor this epoch's PCM transform applies to the utterance (1 without speed perturbation). It is the
+    /// transform's first random draw, so batches can be formed on the perturbed lengths before the audio is read.
+    public func speedFactor(path: String) -> Float {
+        if speed != true {
+            return 1.0
+        }
+        var rng = SplitMix64(seed: Self.seed(forPath: path) ^ epochSalt)
+        return Float.random(in: Self.speedRange, using: &rng)
+    }
+
+    /// Feature frames of an utterance of `frames` frames after this epoch's speed perturbation.
+    public func frameCount(_ frames: Int, path: String) -> Int {
+        let factor = speedFactor(path: path)
+        if abs(factor - 1.0) < 1e-4 {
+            return frames
+        }
+        return max(1, Int(Float(frames) / factor))
+    }
+
     func transformPCM(path: String, _ pcm: [Float]) -> [Float] {
         var rng = SplitMix64(seed: Self.seed(forPath: path) ^ epochSalt)
         var out = pcm

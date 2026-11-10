@@ -453,6 +453,8 @@ if 0 < epochs {
     let lengthSortedIndices = feasibleIndices.sorted { a, b in
         return dataset.frameCount(at: a) < dataset.frameCount(at: b)
     }
+    // Frame counts the batches are formed on: the utterance lengths, or this epoch's speed-perturbed lengths.
+    var epochFrames = (0..<dataset.count).map { dataset.frameCount(at: $0) }
     // Activation memory grows with utterances × padded frames × width, so batches are capped by that product.
     let widthRatio = Double(mlxNetwork.modelDim) / Double(HawkShape.defaultModelDim)
     let frameBudget = Int(Double(batchSize * Defaults.fullBatchFrames) / widthRatio)
@@ -461,13 +463,13 @@ if 0 < epochs {
         var current: [Int] = []
         var maxFrames = 0
         for idx in order {
-            maxFrames = max(maxFrames, dataset.frameCount(at: idx))
+            maxFrames = max(maxFrames, epochFrames[idx])
             let padded = ((maxFrames + 31) / 32) * 32
             let fits = (current.count + 1) * padded <= frameBudget
             if current.isEmpty != true && (current.count == batchSize || fits != true) {
                 groups.append(current)
                 current = []
-                maxFrames = dataset.frameCount(at: idx)
+                maxFrames = epochFrames[idx]
             }
             current.append(idx)
         }
@@ -484,7 +486,7 @@ if 0 < epochs {
     func paddedFrameCount(of group: [Int]) -> Int {
         var maxFrames = 0
         for idx in group {
-            maxFrames = max(maxFrames, dataset.frameCount(at: idx))
+            maxFrames = max(maxFrames, epochFrames[idx])
         }
         return ((maxFrames + 31) / 32) * 32
     }
@@ -555,9 +557,18 @@ if 0 < epochs {
     while ep <= epochs {
         let epStartTime = CFAbsoluteTimeGetCurrent()
         augmenter.epochSalt = UInt64(ep)
+        var epochIndices = feasibleIndices
+        if augmenter.speed {
+            epochFrames = (0..<dataset.count).map { augmenter.frameCount(dataset.frameCount(at: $0), path: dataset.metaSamples[$0].path) }
+            epochIndices = feasibleIndices.filter { ctcMinimumFrames(allTargets[$0]) <= epochFrames[$0] }
+            print("  speed perturbation: \(feasibleIndices.count - epochIndices.count) utterances CTC-infeasible this epoch")
+        }
         if 1 < ep {
-            let jittered = feasibleIndices.map { idx in (key: dataset.frameCount(at: idx) + Int(batchOrder.next() % 17) - 8, idx: idx) }
+            let jittered = epochIndices.map { idx in (key: epochFrames[idx] + Int(batchOrder.next() % 17) - 8, idx: idx) }
             batchGroups = batches(jittered.sorted { a, b in a.key < b.key }.map { $0.idx })
+        }
+        if ep == 1 && augmenter.speed {
+            batchGroups = batches(epochIndices.sorted { a, b in epochFrames[a] < epochFrames[b] })
         }
         batchGroups.shuffle(using: &batchOrder)
         groupBucketsWithinWindows(&batchGroups, window: Defaults.bucketRunWindow)
