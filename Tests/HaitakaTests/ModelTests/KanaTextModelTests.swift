@@ -37,6 +37,15 @@ final class KanaTextModelTests: XCTestCase {
         XCTAssertEqual(KanaTextRepetition.longest([5, 6, 5, 6, 7, 7, 7, 7, 8]), 4)
     }
 
+    /// The zeros of 1000 are not a loop even when the kana (せん) repeats nothing; a longer run of one character is.
+    func testSingleCharacterRunsNeedMoreCopies() {
+        XCTAssertFalse(KanaTextRepetition.exceeds((period: 1, count: 3), allowed: 2))
+        XCTAssertFalse(KanaTextRepetition.exceeds((period: 1, count: KanaTextRepetition.singleRun), allowed: 2))
+        XCTAssertTrue(KanaTextRepetition.exceeds((period: 1, count: KanaTextRepetition.singleRun + 1), allowed: 2))
+        XCTAssertTrue(KanaTextRepetition.exceeds((period: 2, count: 3), allowed: 2))
+        XCTAssertFalse(KanaTextRepetition.exceeds((period: 2, count: 3), allowed: 3))
+    }
+
     func testStepDecodingMatchesTeacherForcedDecoding() {
         var shape = KanaTextShape()
         shape.modelDim = 32
@@ -118,6 +127,23 @@ final class KanaTextModelTests: XCTestCase {
         let heard = both.decode(previous, memory: both.encode(source), mask: mask, audio: audio,
                                 audioMask: MLXKanaTextModel.paddingMask([5], width: 6))
         XCTAssertLessThan(abs(heard - expected).max().item(Float.self), 1e-5)
+    }
+
+    /// Unit-by-unit conversion with a zero-initialized frame attention gives the kana model's units.
+    func testUnitGreedyWithZeroListenMatchesTheKanaModel() {
+        let kanaOnly = MLXKanaTextModel(shape: smallShape(), inputVocabulary: 11, outputVocabulary: 13)
+        var listening = smallShape()
+        listening.audioDim = 7
+        let both = MLXKanaTextModel(shape: listening, inputVocabulary: 11, outputVocabulary: 13)
+        let own = Dictionary(uniqueKeysWithValues: both.parameters().flattened())
+        let shared = Dictionary(uniqueKeysWithValues: kanaOnly.parameters().flattened()).filter { own[$0.key]?.shape == $0.value.shape }
+        both.update(parameters: ModuleParameters.unflattened(shared))
+        let source = MLXArray([4, 5, 6, 7, 8, 4, 0, 0] as [Int32], [2, 4])
+        let units: [[Range<Int>]] = [[0..<2, 2..<4], [0..<2]]
+        let expected = kanaOnly.greedy(source, units: units)
+        let heard = both.greedy(source, units: units, audio: MLXRandom.normal([2, 6, 7]), frameCounts: [6, 4])
+        XCTAssertEqual(heard.units, expected.units)
+        XCTAssertEqual(heard.cut, expected.cut)
     }
 
     /// Listening only: stepping one character at a time matches teacher forcing, and padded frames are ignored.

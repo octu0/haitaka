@@ -107,6 +107,22 @@ struct Chunk {
     var target: [Int] = []
     var targetUnit: [Int] = []
     var units = 0
+
+    /// Appends one unit: its kana to the source and its text, ended by `eos`, to the target.
+    mutating func append(kana: String, text: String, _ vocabulary: KanaTextVocabulary) {
+        let k = vocabulary.encodeInput(kana)
+        let t = vocabulary.encodeOutput(text) + [KanaTextVocabulary.eos]
+        source += k
+        sourceUnit += [Int](repeating: units, count: k.count)
+        var start = KanaTextVocabulary.eos
+        if units == 0 {
+            start = KanaTextVocabulary.bos
+        }
+        previous += [start] + t.dropLast()
+        target += t
+        targetUnit += [Int](repeating: units, count: t.count)
+        units += 1
+    }
 }
 
 /// Consecutive lines of each stream, split into units, packed into chunks of about `chunkKana` kana.
@@ -129,14 +145,7 @@ func makeChunks(_ pairs: [Pair], _ vocabulary: KanaTextVocabulary) -> [Chunk] {
             stream = p.label
         }
         for u in KanaTextUnits.paired(kana: p.kana, text: p.text) {
-            let k = vocabulary.encodeInput(u.kana)
-            let t = vocabulary.encodeOutput(u.text) + [KanaTextVocabulary.eos]
-            current.source += k
-            current.sourceUnit += [Int](repeating: current.units, count: k.count)
-            current.previous += [current.units == 0 ? KanaTextVocabulary.bos : KanaTextVocabulary.eos] + t.dropLast()
-            current.target += t
-            current.targetUnit += [Int](repeating: current.units, count: t.count)
-            current.units += 1
+            current.append(kana: u.kana, text: u.text, vocabulary)
         }
     }
     close()

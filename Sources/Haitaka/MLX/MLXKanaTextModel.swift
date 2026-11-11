@@ -233,6 +233,18 @@ public enum KanaTextRepetition {
         return best
     }
 
+    /// A run of one character (digits of 1000, ーーー) counts as a loop only past this many copies, whatever the kana has.
+    static let singleRun = 6
+
+    /// Whether the text's tail repeats more than allowed: more copies than `allowed`, and for a single character
+    /// also more than `singleRun`.
+    public static func exceeds(_ repeated: (period: Int, count: Int), allowed: Int) -> Bool {
+        if repeated.period == 1 {
+            return max(allowed, singleRun) < repeated.count
+        }
+        return allowed < repeated.count
+    }
+
     /// The most consecutive copies of any span anywhere in `ids`.
     public static func longest(_ ids: [Int]) -> Int {
         var best = 1
@@ -331,8 +343,8 @@ extension MLXHawkLayer {
 /// targets) left to right; the decoder writes text one character per step and attends only to the encoder outputs of
 /// the current unit (kana up to a punctuation mark). Both carry their recurrent state across units, so context reaches
 /// back over the whole stream while memory stays constant. Each unit's text ends with `eos`, which also starts the next.
-/// With `audioDim`, each decoder layer also attends to the acoustic model's output frames of the unit (`listen`); with
-/// `kanaInput` off it attends to those frames only.
+/// With `audioDim`, each decoder layer also attends to the acoustic model's output frames of the utterance (`listen`);
+/// with `kanaInput` off it attends to those frames only.
 public final class MLXKanaTextModel: Module, @unchecked Sendable {
     public let shape: KanaTextShape
     public var inputEmbedding: MLXArray
@@ -468,8 +480,10 @@ public final class MLXKanaTextModel: Module, @unchecked Sendable {
     /// Greedy streaming conversion of a batch of streams. `units[b]` lists the [start, end) kana spans of row b's
     /// units in `source` order; returns the text ids of every unit and how many units were cut short. A unit is cut when
     /// its text ends in more copies of a span than its kana has anywhere (at least two): the extra copies are dropped
-    /// and the unit ends there.
-    public func greedy(_ source: MLXArray, units: [[Range<Int>]]) -> (units: [[[Int]]], cut: Int) {
+    /// and the unit ends there. With `audio` [B, F, audioDim], every unit also listens to its row's frames
+    /// (`frameCounts` long).
+    public func greedy(_ source: MLXArray, units: [[Range<Int>]], audio: MLXArray? = nil,
+                       frameCounts: [Int] = []) -> (units: [[[Int]]], cut: Int) {
         let b = source.dim(0)
         let s = source.dim(1)
         let sourceIds = source.asArray(Int32.self).map { Int($0) }
@@ -480,6 +494,15 @@ public final class MLXKanaTextModel: Module, @unchecked Sendable {
         let memory = encode(source)
         let kv = cross.map { $0.keysValues(memory) }
         eval(memory)
+        var audioKV: [(MLXArray, MLXArray)] = []
+        var audioMask: MLXArray? = nil
+        if let audio, 0 < shape.audioDim {
+            audioKV = listen.map { $0.keysValues(audio) }
+            audioMask = Self.paddingMask(frameCounts, width: audio.dim(1))
+            for (k, v) in audioKV {
+                eval(k, v)
+            }
+        }
         var states = initialStates(b)
         var unitIndex = [Int](repeating: 0, count: b)
         var produced = [Int](repeating: 0, count: b)
@@ -502,7 +525,8 @@ public final class MLXKanaTextModel: Module, @unchecked Sendable {
                 r += 1
             }
             let mask = MLXArray(maskValues, [b, 1, 1, s])
-            let logits = step(MLXArray(token), states: &states, keysValues: kv, mask: mask)
+            let logits = step(MLXArray(token), states: &states, keysValues: kv, mask: mask, audioKeysValues: audioKV,
+                              audioMask: audioMask)
             let next = argMax(logits, axis: -1).asArray(Int32.self)
             for state in states {
                 eval(state.h, state.conv)
@@ -519,7 +543,7 @@ public final class MLXKanaTextModel: Module, @unchecked Sendable {
                         let u = unitIndex[r]
                         outputs[r][u].append(Int(next[r]))
                         let repeated = KanaTextRepetition.tail(outputs[r][u], end: outputs[r][u].count)
-                        if allowed[r][u] < repeated.count {
+                        if KanaTextRepetition.exceeds(repeated, allowed: allowed[r][u]) {
                             outputs[r][u].removeLast((repeated.count - 1) * repeated.period)
                             cut += 1
                             unitIndex[r] += 1
@@ -540,7 +564,7 @@ public final class MLXKanaTextModel: Module, @unchecked Sendable {
     /// Greedy decoding of one utterance per row, the state starting fresh. `source` [B, S] holds the recognized kana
     /// (`sourceCounts` long) when the model reads kana; `audio` [B, F, audioDim] the acoustic frames (`frameCounts`
     /// long) when it listens. Each row stops at `eos`, after `limits[r]` characters, or when its text ends in more
-    /// copies of a span than `allowed[r]` (the extra copies are dropped).
+    /// copies of a span than `allowed[r]` allows (`KanaTextRepetition.exceeds`; the extra copies are dropped).
     public func greedyUtterances(source: MLXArray?, sourceCounts: [Int], audio: MLXArray?, frameCounts: [Int],
                                  limits: [Int], allowed: [Int]) -> (texts: [[Int]], cut: Int) {
         let b = limits.count
@@ -580,7 +604,7 @@ public final class MLXKanaTextModel: Module, @unchecked Sendable {
                     } else {
                         outputs[r].append(Int(next[r]))
                         let repeated = KanaTextRepetition.tail(outputs[r], end: outputs[r].count)
-                        if allowed[r] < repeated.count {
+                        if KanaTextRepetition.exceeds(repeated, allowed: allowed[r]) {
                             outputs[r].removeLast((repeated.count - 1) * repeated.period)
                             cut += 1
                             done[r] = true

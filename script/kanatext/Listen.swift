@@ -5,12 +5,18 @@ import MLXNN
 import MLXOptimizers
 
 // kanatext listen: the decoder that listens. The acoustic model (frozen, outside the trained module) runs on each
-// batch; its greedy CTC kana feeds the kana encoder and its normalized output frames feed the `listen` cross-attention.
-// One utterance is one unit and the decoder state starts fresh per utterance.
+// batch; its CTC kana feeds the kana encoder and its normalized output frames feed the `listen` cross-attention.
+// The decoder state starts fresh per utterance.
 //   kanatext listen --acoustic <weights.safetensors> --init <kanatext dir> --mode kana|audio|both --out <dir>
-//                   [-e epochs] [--noise-bank <jsonl>] [--eval <manifest.jsonl>]... [<train manifest.jsonl>]
+//                   [-e epochs] [--english-dict <cmudict>] [--kana-lm <kana text>] [--noise-bank <jsonl>]
+//                   [--eval <manifest.jsonl>]... [<train manifest.jsonl>]
 // kana: the kanatext layers on recognized kana; audio: no kana, the decoder attends to the frames; both: kana and
 // frames, the frame attention starting as the identity. -e 0 only evaluates the initial model.
+// With kana, the utterance is split into units at punctuation as in kanatext: each unit's text ends with eos and
+// attends to its own kana, while the frame attention sees the whole utterance. Training pairs the greedy CTC kana's
+// units with the text's when their counts match, and otherwise the reference kana's (from --english-dict, which
+// training with kana needs). Evaluation reads kana from the CTC beam fused with the kana n-gram LM of --kana-lm
+// (greedy without it); an utterance whose kana is only punctuation gets empty text. audio: one utterance is one unit.
 // Writes fileId, reference, output and CTC kana per utterance to <dir>/ep<N>/outputs_<eval name>.tsv.
 
 enum ListenDefaults {
@@ -122,11 +128,11 @@ func listenPadded(_ batch: [[[Float]]]) -> (MLXArray, [Int]) {
     return (MLXArray(flat, [batch.count, width, dim]), counts)
 }
 
-/// The acoustic model's normalized output frames and the greedy CTC kana of each row.
-func listenAcoustic(_ acoustic: MLXHawkNetwork, _ kanaVocabulary: TextVocabulary, features: MLXArray, counts: [Int]) -> (MLXArray, [String]) {
+/// The acoustic model's normalized output frames, its CTC logits and the greedy CTC kana of each row.
+func listenAcoustic(_ acoustic: MLXHawkNetwork, _ kanaVocabulary: TextVocabulary, features: MLXArray, counts: [Int]) -> (MLXArray, MLXArray, [String]) {
     let (output, logits) = acoustic.encoded(features, frameCounts: MLXArray(counts.map { Int32($0) }))
     let best = argMax(logits, axis: -1)
-    eval(output, best)
+    eval(output, logits, best)
     let width = features.dim(1)
     let ids = best.asArray(Int32.self)
     var kana: [String] = []
@@ -146,25 +152,60 @@ func listenAcoustic(_ acoustic: MLXHawkNetwork, _ kanaVocabulary: TextVocabulary
         kana.append(s)
         r += 1
     }
-    return (output, kana)
+    return (output, logits, kana)
 }
 
-/// Kana source ids per row; an empty recognition becomes one unknown token so the attention has a position to read.
-func listenSources(_ kana: [String], _ vocabulary: KanaTextVocabulary) -> ([[Int]], [Int]) {
-    let ids = kana.map { k in
-        let encoded = vocabulary.encodeInput(k)
-        if encoded.isEmpty {
-            return [KanaTextVocabulary.unknown]
-        }
-        return encoded
+final class ListenKana: @unchecked Sendable {
+    var items: [String]
+    init(count: Int) {
+        items = [String](repeating: "", count: count)
     }
-    return (ids, ids.map { $0.count })
 }
 
-/// Greedy decoding of every sample, one utterance at a time. Utterances whose CTC kana is empty get empty text
-/// (the decoder does not run). Returns the character CER (%), units cut by the repetition stop and empty outputs.
+/// CTC beam search fused with the kana n-gram LM over each row's first `counts[r]` frames of `logits` [B, F, V].
+func listenBeamKana(_ logits: MLXArray, counts: [Int], _ kanaVocabulary: TextVocabulary, _ lm: KanaNgramLM) -> [String] {
+    let logp = logSoftmax(logits, axis: -1)
+    eval(logp)
+    let width = logits.dim(1)
+    let v = logits.dim(2)
+    let flat = logp.asArray(Float.self)
+    let buffer = ListenKana(count: counts.count)
+    let workers = max(1, min(ListenDefaults.workers, counts.count))
+    DispatchQueue.concurrentPerform(iterations: workers) { worker in
+        let decoder = CTCDecoder(vocabulary: kanaVocabulary, languageModel: lm)
+        var r = worker
+        while r < counts.count {
+            let frames = (0..<counts[r]).map { t in Array(flat[((r * width + t) * v)..<((r * width + t + 1) * v)]) }
+            buffer.items[r] = decoder.decode(logProbs: frames).text
+            r += workers
+        }
+    }
+    return buffer.items
+}
+
+/// One utterance as a kanatext chunk. The recognized kana's units are paired with the text's when their counts
+/// match; otherwise the reference kana's are (`KanaTextUnits.paired` keeps the line whole if those differ too).
+/// Returns the chunk and whether it reads the recognized kana.
+func listenChunk(recognized: String, reference: String, text: String, _ vocabulary: KanaTextVocabulary) -> (Chunk, Bool) {
+    var kana = reference
+    let units = KanaTextUnits.splitKana(recognized)
+    let recognizedFits = scoringForm(recognized).isEmpty != true && units.count == KanaTextUnits.splitText(text).count
+    if recognizedFits {
+        kana = recognized
+    }
+    var chunk = Chunk()
+    for u in KanaTextUnits.paired(kana: kana, text: text) {
+        chunk.append(kana: u.kana, text: u.text, vocabulary)
+    }
+    return (chunk, recognizedFits)
+}
+
+/// Greedy decoding of every sample. With kana, each utterance is decoded unit by unit (`MLXKanaTextModel.greedy`);
+/// without, as one unit (`greedyUtterances`). Utterances whose CTC kana is only punctuation get empty text. Returns
+/// the character CER (%), units cut by the repetition stop and empty outputs.
 func listenEvaluate(_ model: MLXKanaTextModel, _ vocabulary: KanaTextVocabulary, _ acoustic: MLXHawkNetwork,
-                    _ kanaVocabulary: TextVocabulary, _ samples: [ListenSample], outputPath: String) throws -> (Double, Int, Int) {
+                    _ kanaVocabulary: TextVocabulary, _ lm: KanaNgramLM?, _ samples: [ListenSample],
+                    outputPath: String) throws -> (Double, Int, Int) {
     var rows: [String] = []
     var errors = 0
     var total = 0
@@ -172,27 +213,59 @@ func listenEvaluate(_ model: MLXKanaTextModel, _ vocabulary: KanaTextVocabulary,
     var empty = 0
     for batch in listenBatches(samples) {
         let (features, counts) = listenPadded(listenFeatures(samples, batch, augmenter: nil))
-        let (audio, kana) = listenAcoustic(acoustic, kanaVocabulary, features: features, counts: counts)
-        let (sources, sourceCounts) = listenSources(kana, vocabulary)
-        let limits = kana.map { k in
-            if k.isEmpty {
-                return 0
-            }
-            return 2 * k.count + 8
+        let (audio, logits, greedyKana) = listenAcoustic(acoustic, kanaVocabulary, features: features, counts: counts)
+        var kana = greedyKana
+        if let lm {
+            kana = listenBeamKana(logits, counts: counts, kanaVocabulary, lm)
         }
-        let allowed = sources.map { max(2, KanaTextRepetition.longest($0)) }
-        var source: MLXArray? = nil
+        let silent = kana.map { scoringForm($0).isEmpty }
+        var listened: MLXArray? = nil
+        if 0 < model.shape.audioDim {
+            listened = audio
+        }
+        var texts: [String] = []
         if model.shape.kanaInput {
-            source = padded(sources, width: roundUp(sourceCounts.max() ?? 1), fill: KanaTextVocabulary.pad)
+            var sources: [[Int]] = []
+            var spans: [[Range<Int>]] = []
+            for k in kana {
+                var ids: [Int] = []
+                var units: [Range<Int>] = []
+                for u in KanaTextUnits.splitKana(k) {
+                    let encoded = vocabulary.encodeInput(u)
+                    units.append(ids.count..<(ids.count + encoded.count))
+                    ids += encoded
+                }
+                if ids.isEmpty {
+                    ids = [KanaTextVocabulary.unknown]
+                    units = [0..<1]
+                }
+                sources.append(ids)
+                spans.append(units)
+            }
+            let width = roundUp(sources.map { $0.count }.max() ?? 1)
+            let result = model.greedy(padded(sources, width: width, fill: KanaTextVocabulary.pad), units: spans,
+                                      audio: listened, frameCounts: counts)
+            cut += result.cut
+            texts = result.units.map { u in u.map { vocabulary.decodeOutput($0) }.joined() }
+        } else {
+            let limits = kana.indices.map { r in
+                if silent[r] {
+                    return 0
+                }
+                return 2 * kana[r].count + 8
+            }
+            let allowed = kana.map { max(2, KanaTextRepetition.longest(vocabulary.encodeInput($0))) }
+            let result = model.greedyUtterances(source: nil, sourceCounts: [], audio: listened, frameCounts: counts,
+                                                limits: limits, allowed: allowed)
+            cut += result.cut
+            texts = result.texts.map { vocabulary.decodeOutput($0) }
         }
-        let result = model.greedyUtterances(source: source, sourceCounts: sourceCounts, audio: audio, frameCounts: counts,
-                                            limits: limits, allowed: allowed)
-        cut += result.cut
         var i = 0
         while i < batch.count {
             let s = samples[batch[i]]
-            let text = vocabulary.decodeOutput(result.texts[i])
-            if kana[i].isEmpty {
+            var text = texts[i]
+            if silent[i] {
+                text = ""
                 empty += 1
             }
             let ref = scoringForm(s.text)
@@ -209,7 +282,7 @@ func listenEvaluate(_ model: MLXKanaTextModel, _ vocabulary: KanaTextVocabulary,
 func runListen(options: [String: [String]], positional: [String]) throws {
     guard let acousticPath = options["--acoustic"]?.first, let initDir = options["--init"]?.first,
           let mode = options["--mode"]?.first, ["kana", "audio", "both"].contains(mode), let outDir = options["--out"]?.first else {
-        fail("usage: kanatext listen --acoustic <weights> --init <kanatext dir> --mode kana|audio|both --out <dir> [-e epochs] [--noise-bank <jsonl>] [--eval <manifest>]... [<train manifest>]")
+        fail("usage: kanatext listen --acoustic <weights> --init <kanatext dir> --mode kana|audio|both --out <dir> [-e epochs] [--english-dict <cmudict>] [--kana-lm <kana text>] [--noise-bank <jsonl>] [--eval <manifest>]... [<train manifest>]")
     }
     let epochs = Int(options["-e"]?.first ?? "") ?? ListenDefaults.epochs
     if 0 < epochs && positional.count != 1 {
@@ -242,12 +315,19 @@ func runListen(options: [String: [String]], positional: [String]) throws {
     let parameterCount = own.values.reduce(0) { $0 + $1.size }
     print("mode \(mode): \(parameterCount) parameters, \(kept.count) of \(own.count) arrays from \(initDir); acoustic \(acousticPath) (\(acoustic.modelDim) wide, frozen)")
 
+    var lm: KanaNgramLM? = nil
+    if let lmPath = options["--kana-lm"]?.first {
+        guard let loaded = KanaNgramLM(contentsOfFile: lmPath, vocabulary: kanaVocabulary) else {
+            fail("kanatext listen: cannot read \(lmPath)")
+        }
+        lm = loaded
+    }
     let evalSets = (options["--eval"] ?? []).map { (name: (($0 as NSString).lastPathComponent as NSString).deletingPathExtension, samples: readListenSamples($0)) }
     func evaluateAll(_ dir: String) throws -> Double {
         try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         var selection = 0.0
         for set in evalSets {
-            let (cer, cut, empty) = try listenEvaluate(model, vocabulary, acoustic, kanaVocabulary, set.samples,
+            let (cer, cut, empty) = try listenEvaluate(model, vocabulary, acoustic, kanaVocabulary, lm, set.samples,
                                                        outputPath: dir + "/outputs_\(set.name).tsv")
             print(String(format: "  %@: CER %.2f%% (%d utterances, %d cut, %d without CTC kana)", set.name, cer, set.samples.count, cut, empty))
             if selection == 0.0 {
@@ -274,6 +354,22 @@ func runListen(options: [String: [String]], positional: [String]) throws {
     var batches = listenBatches(samples)
     let totalSteps = epochs * batches.count
     print("train \(samples.count) utterances (\(loaded.count - samples.count) dropped: empty or more than \(ListenDefaults.maxCharsPerFrame) characters per frame), \(batches.count) batches per epoch, \(totalSteps) steps")
+    var referenceKana: [String] = []
+    if shape.kanaInput {
+        guard let dictPath = options["--english-dict"]?.first, let english = try? EnglishPronunciations(contentsOfFile: dictPath) else {
+            fail("kanatext listen: training with kana needs --english-dict <cmudict>")
+        }
+        let converter = KanjiConverter(english: english)
+        let buffer = ListenKana(count: samples.count)
+        DispatchQueue.concurrentPerform(iterations: 16) { worker in
+            var i = worker
+            while i < samples.count {
+                buffer.items[i] = converter.convertToHiragana(samples[i].text)
+                i += 16
+            }
+        }
+        referenceKana = buffer.items
+    }
 
     let optimizer = ArrayLRAdam(learningRate: ListenDefaults.lrMax, betas: (0.9, 0.98), eps: 1e-9)
     let scheduler = CosineLRScheduler(lrMax: ListenDefaults.lrMax, lrMin: 0.0)
@@ -303,6 +399,7 @@ func runListen(options: [String: [String]], positional: [String]) throws {
         batches.shuffle(using: &order)
         var lossSum: Float = 0.0
         var windowSum: Float = 0.0
+        var recognizedUtterances = 0
         let prefetch = ListenFeatures(count: 0)
         prefetch.items = listenFeatures(samples, batches[0], augmenter: augmenter)
         var bi = 0
@@ -317,22 +414,44 @@ func runListen(options: [String: [String]], positional: [String]) throws {
                     group.leave()
                 }
             }
-            let members = batches[bi].map { samples[$0] }
             let (features, counts) = listenPadded(current)
-            let (audio, kana) = listenAcoustic(acoustic, kanaVocabulary, features: features, counts: counts)
-            let (sources, sourceCounts) = listenSources(kana, vocabulary)
-            let targetsRows = members.map { vocabulary.encodeOutput($0.text) + [KanaTextVocabulary.eos] }
-            let previousRows = targetsRows.map { [KanaTextVocabulary.bos] + $0.dropLast() }
-            let sw = roundUp(sourceCounts.max() ?? 1)
-            let tw = roundUp(targetsRows.map { $0.count }.max() ?? 1)
-            let inputs = [
-                padded(sources, width: sw, fill: KanaTextVocabulary.pad),
-                padded(previousRows, width: tw, fill: KanaTextVocabulary.pad),
-                padded(targetsRows, width: tw, fill: KanaTextVocabulary.pad),
-                MLXKanaTextModel.paddingMask(sourceCounts, width: sw),
-                audio,
-                MLXKanaTextModel.paddingMask(counts, width: features.dim(1))
-            ]
+            let (audio, _, kana) = listenAcoustic(acoustic, kanaVocabulary, features: features, counts: counts)
+            var inputs: [MLXArray] = []
+            if shape.kanaInput {
+                var chunks: [Chunk] = []
+                var i = 0
+                while i < batches[bi].count {
+                    let index = batches[bi][i]
+                    let (chunk, recognized) = listenChunk(recognized: kana[i], reference: referenceKana[index], text: samples[index].text, vocabulary)
+                    chunks.append(chunk)
+                    if recognized {
+                        recognizedUtterances += 1
+                    }
+                    i += 1
+                }
+                let sw = roundUp(chunks.map { $0.source.count }.max() ?? 1)
+                let tw = roundUp(chunks.map { $0.target.count }.max() ?? 1)
+                inputs = [
+                    padded(chunks.map { $0.source }, width: sw, fill: KanaTextVocabulary.pad),
+                    padded(chunks.map { $0.previous }, width: tw, fill: KanaTextVocabulary.pad),
+                    padded(chunks.map { $0.target }, width: tw, fill: KanaTextVocabulary.pad),
+                    unitMask(chunks, targetWidth: tw, sourceWidth: sw),
+                    audio,
+                    MLXKanaTextModel.paddingMask(counts, width: features.dim(1))
+                ]
+            } else {
+                let targetsRows = batches[bi].map { vocabulary.encodeOutput(samples[$0].text) + [KanaTextVocabulary.eos] }
+                let previousRows = targetsRows.map { [KanaTextVocabulary.bos] + $0.dropLast() }
+                let tw = roundUp(targetsRows.map { $0.count }.max() ?? 1)
+                inputs = [
+                    MLXArray.zeros([1, 1], type: Int32.self),
+                    padded(previousRows, width: tw, fill: KanaTextVocabulary.pad),
+                    padded(targetsRows, width: tw, fill: KanaTextVocabulary.pad),
+                    MLXArray.zeros([1, 1, 1, 1]),
+                    audio,
+                    MLXKanaTextModel.paddingMask(counts, width: features.dim(1))
+                ]
+            }
             step += 1
             // ArrayLRAdam has no bias correction; it is applied to the learning rate.
             let t = Float(step)
@@ -355,6 +474,9 @@ func runListen(options: [String: [String]], positional: [String]) throws {
         }
         print(String(format: "epoch %d/%d loss %.4f (%.0f s, peak %d MB)", ep, epochs, lossSum / Float(batches.count),
                      CFAbsoluteTimeGetCurrent() - start, MLX.GPU.peakMemory >> 20))
+        if shape.kanaInput {
+            print("  units from recognized kana in \(recognizedUtterances) of \(samples.count) utterances (the rest from reference kana)")
+        }
         let selection = try evaluateAll(outDir + "/ep\(ep)")
         try saveModel(model, vocabulary: vocabulary, to: outDir + "/ep\(ep)")
         if 0.0 < selection && selection < best {
