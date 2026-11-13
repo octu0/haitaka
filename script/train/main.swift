@@ -64,7 +64,6 @@ var voiceBankPath = ""
 var dictTextPaths: [String] = []
 var kanaLMPath = ""
 var evalDumpPath = ""
-var augmentOptions: Set<String> = []
 var exportWeightsPath: String? = nil
 var importWeightsPath: String? = nil
 
@@ -89,7 +88,6 @@ while argIdx < args.count {
         print("  --dict-text <path>                 Text added only to the kana-kanji dictionary (.txt/.srt or a directory; repeatable)")
         print("  --kana-lm <path>                   Kana text, one sentence per line (kanalm output). Fused into the eval CTC beam search as an n-gram LM")
         print("  --eval-dump <jsonl>                Write per-utterance eval results")
-        print("  --augment <speed,spec>             Training data augmentation (speed: 0.9-1.1x speed perturbation, spec: SpecAugment)")
         exit(0)
     case "-p", "--parallel":
         if (argIdx + 1) < args.count {
@@ -154,21 +152,6 @@ while argIdx < args.count {
             evalDumpPath = args[argIdx + 1]
             argIdx += 1
         }
-    case "--augment":
-        if (argIdx + 1) < args.count {
-            for item in args[argIdx + 1].split(separator: ",") {
-                let name = item.trimmingCharacters(in: .whitespaces)
-                if name == "speed" || name == "spec" {
-                    augmentOptions.insert(name)
-                    continue
-                }
-                if name.isEmpty != true {
-                    print("error: unknown --augment value \(name) (expected speed, spec)")
-                    exit(1)
-                }
-            }
-            argIdx += 1
-        }
     case "--export-weights":
         if (argIdx + 1) < args.count {
             exportWeightsPath = args[argIdx + 1]
@@ -203,7 +186,7 @@ if noiseBankPath.isEmpty != true {
         exit(1)
     }
     noiseBank = bank
-    print("noise bank: \(noiseBankPath) (\(bank.count) clips, \(String(format: "%.1f", bank.totalSeconds / 60.0)) min; probability \(bank.probability), SNR \(bank.snrRange.lowerBound)-\(bank.snrRange.upperBound) dB)")
+    print("noise bank: \(noiseBankPath) (\(bank.count) clips, \(String(format: "%.1f", bank.totalSeconds / 60.0)) min; probability \(bank.probability) clean / \(bank.recordedProbability) with background sound, target SNR \(bank.snrRange.lowerBound)-\(bank.snrRange.upperBound) dB over voiced frames, counting the noise already present)")
 }
 var voiceBank: NoiseBank? = nil
 if voiceBankPath.isEmpty != true {
@@ -215,15 +198,8 @@ if voiceBankPath.isEmpty != true {
     voiceBank = bank
     print("voice bank: \(voiceBankPath) (\(bank.count) clips, \(String(format: "%.1f", bank.totalSeconds / 60.0)) min; probability \(bank.probability), SNR \(bank.snrRange.lowerBound)-\(bank.snrRange.upperBound) dB, placed once)")
 }
-let augmenter = FeatureAugmenter(
-    speed: augmentOptions.contains("speed"),
-    specAugment: augmentOptions.contains("spec"),
-    noiseBank: noiseBank,
-    voiceBank: voiceBank
-)
-if augmentOptions.isEmpty != true {
-    print("augmentation: \(augmentOptions.sorted().joined(separator: ", ")) (speed \(FeatureAugmenter.speedRange.lowerBound)-\(FeatureAugmenter.speedRange.upperBound)x / time masks \(FeatureAugmenter.timeMasks) x <= \(FeatureAugmenter.maxTimeMaskFrames) frames / frequency masks \(FeatureAugmenter.frequencyMasks) x <= \(FeatureAugmenter.maxFrequencyMaskBands) bands)")
-}
+let augmenter = FeatureAugmenter(speed: true, noiseBank: noiseBank, voiceBank: voiceBank)
+print("speed perturbation: \(FeatureAugmenter.speedRange.lowerBound)-\(FeatureAugmenter.speedRange.upperBound)x")
 
 if datasetPath.isEmpty {
     print("error: specify a manifest (JSONL). See train --help.")
@@ -449,11 +425,11 @@ if 0 < epochs {
         print("  excluded as too long: \(tooLongCount) (over \(Defaults.maxTrainFrames) frames)")
     }
 
-    // Batches are formed from length-sorted utterances once; their order is shuffled every epoch.
+    // Batches formed on the unperturbed lengths size the learning-rate schedule; each epoch re-forms them.
     let lengthSortedIndices = feasibleIndices.sorted { a, b in
         return dataset.frameCount(at: a) < dataset.frameCount(at: b)
     }
-    // Frame counts the batches are formed on: the utterance lengths, or this epoch's speed-perturbed lengths.
+    // Frame counts the batches are formed on: the utterance lengths, then each epoch's speed-perturbed lengths.
     var epochFrames = (0..<dataset.count).map { dataset.frameCount(at: $0) }
     // Activation memory grows with utterances × padded frames × width, so batches are capped by that product.
     let widthRatio = Double(mlxNetwork.modelDim) / Double(HawkShape.defaultModelDim)
@@ -517,8 +493,8 @@ if 0 < epochs {
                 buffer.items[i] = autoreleasepool {
                     SpeechDataset.loadFeatures(
                         path: meta.path,
-                        pcmTransform: augmenter.pcmTransform,
-                        featureTransform: augmenter.featureTransform
+                        key: FeatureAugmenter.key(path: meta.path, index: indices[i]),
+                        pcmTransform: augmenter.pcmTransform
                     ).features
                 }
                 i += workerCount
@@ -557,17 +533,14 @@ if 0 < epochs {
     while ep <= epochs {
         let epStartTime = CFAbsoluteTimeGetCurrent()
         augmenter.epochSalt = UInt64(ep)
-        var epochIndices = feasibleIndices
-        if augmenter.speed {
-            epochFrames = (0..<dataset.count).map { augmenter.frameCount(dataset.frameCount(at: $0), path: dataset.metaSamples[$0].path) }
-            epochIndices = feasibleIndices.filter { ctcMinimumFrames(allTargets[$0]) <= epochFrames[$0] }
-            print("  speed perturbation: \(feasibleIndices.count - epochIndices.count) utterances CTC-infeasible this epoch")
-        }
+        epochFrames = (0..<dataset.count).map { augmenter.frameCount(dataset.frameCount(at: $0), path: FeatureAugmenter.key(path: dataset.metaSamples[$0].path, index: $0)) }
+        let epochIndices = feasibleIndices.filter { ctcMinimumFrames(allTargets[$0]) <= epochFrames[$0] }
+        print("  speed perturbation: \(feasibleIndices.count - epochIndices.count) utterances CTC-infeasible this epoch")
         if 1 < ep {
             let jittered = epochIndices.map { idx in (key: epochFrames[idx] + Int(batchOrder.next() % 17) - 8, idx: idx) }
             batchGroups = batches(jittered.sorted { a, b in a.key < b.key }.map { $0.idx })
         }
-        if ep == 1 && augmenter.speed {
+        if ep == 1 {
             batchGroups = batches(epochIndices.sorted { a, b in epochFrames[a] < epochFrames[b] })
         }
         batchGroups.shuffle(using: &batchOrder)

@@ -2,8 +2,12 @@ import Foundation
 
 /// Bank of interfering audio mixed into utterances during training while the label stays the utterance's own text.
 ///
-/// Clips from a JSONL manifest (`{"path": ...}`) are held as 16 kHz mono PCM. With probability `probability`,
-/// one random clip is scaled to an SNR drawn from `snrRange` relative to the utterance RMS and added.
+/// Clips from a JSONL manifest (`{"path": ...}`) are held as 16 kHz mono PCM. A clean recording (its quietest frames
+/// `cleanFloorDB` or more below its voiced frames: TTS, read speech) gets noise with probability `probability`, a
+/// recording that already carries background sound (streams, videos) with `recordedProbability`. Then a target SNR is drawn from `snrRange` and one random clip is added so the utterance reaches it. The SNR is measured
+/// on the voiced frames (pauses do not lower the reference), and the noise already in the utterance counts toward it:
+/// a clean recording gets the whole amount, a stream that already carries game audio gets only what is missing, and an
+/// utterance already noisier than the target is left as it is.
 /// Background noise (game audio, BGM, sound effects) is tiled over the whole utterance. Read-aloud bot voices
 /// (`voice`) are placed once at a random position, as a bot reads a comment over the streamer.
 public final class NoiseBank: @unchecked Sendable {
@@ -15,16 +19,26 @@ public final class NoiseBank: @unchecked Sendable {
     }
 
     public static let sampleRate = 16000
-    /// Probability that an utterance gets noise.
-    public static let probability: Double = 0.5
-    /// SNR range in dB, sampled uniformly.
-    public static let snrRange: ClosedRange<Float> = 5.0...20.0
+    /// Probability that a clean recording gets noise, and that a recording with its own background sound does.
+    public static let probability: Double = 0.7
+    public static let recordedProbability: Double = 0.25
+    /// Voiced-to-floor ratio in dB from which a recording counts as clean.
+    public static let cleanFloorDB: Float = 40.0
+    /// Target SNR range in dB over the voiced frames, sampled uniformly.
+    public static let snrRange: ClosedRange<Float> = 3.0...20.0
+    /// Levels are measured on frames of this many samples (20 ms).
+    public static let levelFrame = 320
+    /// Frames within this ratio of the 95th-percentile frame energy (-10 dB) count as voiced.
+    public static let voicedRatio: Float = 0.1
+    /// The quietest fraction of frames gives the noise already in the utterance.
+    public static let floorFraction: Float = 0.1
     /// Bot voices are as loud as the streamer or a little quieter.
     public static let voiceProbability: Double = 0.3
     public static let voiceSNRRange: ClosedRange<Float> = 0.0...10.0
 
     private let clips: [[Float]]
     public let probability: Double
+    public let recordedProbability: Double
     public let snrRange: ClosedRange<Float>
     public let placement: Placement
 
@@ -42,16 +56,19 @@ public final class NoiseBank: @unchecked Sendable {
 
     /// `clips` are 16 kHz mono PCM. Empty clips are dropped.
     public init(clips: [[Float]], probability: Double = NoiseBank.probability,
+                recordedProbability: Double = NoiseBank.recordedProbability,
                 snrRange: ClosedRange<Float> = NoiseBank.snrRange, placement: Placement = .tiled) {
         self.clips = clips.filter { $0.isEmpty != true }
         self.probability = probability
+        self.recordedProbability = recordedProbability
         self.snrRange = snrRange
         self.placement = placement
     }
 
     /// A bank of read-aloud bot voices: placed once at `voiceSNRRange` with `voiceProbability`.
     public static func voice(clips: [[Float]]) -> NoiseBank {
-        return NoiseBank(clips: clips, probability: voiceProbability, snrRange: voiceSNRRange, placement: .once)
+        return NoiseBank(clips: clips, probability: voiceProbability, recordedProbability: voiceProbability,
+                         snrRange: voiceSNRRange, placement: .once)
     }
 
     /// Loads the WAV files listed in a JSONL manifest (`path` key), resampled to 16 kHz. Unreadable files are skipped.
@@ -88,7 +105,12 @@ public final class NoiseBank: @unchecked Sendable {
         if clips.isEmpty || speech.isEmpty {
             return speech
         }
-        if probability < Double.random(in: 0.0..<1.0, using: &rng) {
+        let level = Self.levels(speech)
+        var chance = recordedProbability
+        if level.floor * powf(10.0, Self.cleanFloorDB / 10.0) <= level.voiced {
+            chance = probability
+        }
+        if chance < Double.random(in: 0.0..<1.0, using: &rng) {
             return speech
         }
         let snrDB = Float.random(in: snrRange, using: &rng)
@@ -98,7 +120,49 @@ public final class NoiseBank: @unchecked Sendable {
             return Self.overlay(speech: speech, voice: clip, start: start, snrDB: snrDB)
         }
         let offset = Int.random(in: 0..<clip.count, using: &rng)
-        return Self.mix(speech: speech, noise: clip, offset: offset, snrDB: snrDB)
+        let missing = level.voiced / powf(10.0, snrDB / 10.0) - level.floor
+        if missing <= 0.0 {
+            return speech
+        }
+        return Self.add(speech: speech, noise: clip, offset: offset, power: missing)
+    }
+
+    /// Mean energy of the voiced frames and of the quietest frames (the noise floor already present).
+    public static func levels(_ x: [Float]) -> (voiced: Float, floor: Float) {
+        var energies: [Float] = []
+        var start = 0
+        while start < x.count {
+            let end = min(x.count, start + levelFrame)
+            var acc: Float = 0.0
+            var i = start
+            while i < end {
+                acc += x[i] * x[i]
+                i += 1
+            }
+            energies.append(acc / Float(end - start))
+            start = end
+        }
+        if energies.isEmpty {
+            return (0.0, 0.0)
+        }
+        let sorted = energies.sorted()
+        let loud = sorted[min(sorted.count - 1, Int(Float(sorted.count - 1) * 0.95))]
+        var voicedSum: Float = 0.0
+        var voicedCount = 0
+        for e in energies {
+            if loud * voicedRatio <= e {
+                voicedSum += e
+                voicedCount += 1
+            }
+        }
+        let floorCount = max(1, Int(Float(sorted.count) * floorFraction))
+        var floorSum: Float = 0.0
+        var i = 0
+        while i < floorCount {
+            floorSum += sorted[i]
+            i += 1
+        }
+        return (voicedSum / Float(max(1, voicedCount)), floorSum / Float(floorCount))
     }
 
     /// Adds `voice` once, its first sample at `start` (negative starts cut its head, and its tail is cut at the end).
@@ -122,14 +186,18 @@ public final class NoiseBank: @unchecked Sendable {
         return out
     }
 
-    /// Deterministic mix. `noise` is read from `offset` and wraps around as needed.
-    /// Noise gain is speechRMS / noiseRMS / 10^(SNR/20).
+    /// Deterministic mix at an SNR against the whole-utterance RMS. `noise` is read from `offset` and wraps around.
     public static func mix(speech: [Float], noise: [Float], offset: Int, snrDB: Float) -> [Float] {
-        if noise.isEmpty || speech.isEmpty {
-            return speech
-        }
         let speechRMS = rms(speech)
         if speechRMS <= 1e-6 {
+            return speech
+        }
+        return add(speech: speech, noise: noise, offset: offset, power: speechRMS * speechRMS / powf(10.0, snrDB / 10.0))
+    }
+
+    /// Adds `noise`, read from `offset` and wrapped around, scaled to mean energy `power` over the utterance.
+    public static func add(speech: [Float], noise: [Float], offset: Int, power: Float) -> [Float] {
+        if noise.isEmpty || speech.isEmpty || power <= 0.0 {
             return speech
         }
         var segment = [Float](repeating: 0.0, count: speech.count)
@@ -147,7 +215,7 @@ public final class NoiseBank: @unchecked Sendable {
         if noiseRMS <= 1e-6 {
             return speech
         }
-        let gain = speechRMS / noiseRMS / powf(10.0, snrDB / 20.0)
+        let gain = power.squareRoot() / noiseRMS
         var out = speech
         i = 0
         while i < out.count {

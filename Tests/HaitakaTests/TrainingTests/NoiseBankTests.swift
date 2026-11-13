@@ -54,35 +54,80 @@ final class NoiseBankTests: XCTestCase {
         XCTAssertEqual(NoiseBank.mix(speech: speech, noise: [], offset: 0, snrDB: 5.0), speech)
     }
 
-    func testBankMixesWithinConfiguredSNRRange() {
+    /// 0.6 s of tone followed by 0.4 s of silence: the voiced frames are the tone.
+    private func toneThenSilence(amplitude: Float) -> [Float] {
+        return tone(count: 9600, amplitude: amplitude, period: 100) + [Float](repeating: 0.0, count: 6400)
+    }
+
+    private func residualPower(_ mixed: [Float], _ speech: [Float]) -> Float {
+        var acc: Float = 0.0
+        var i = 0
+        while i < mixed.count {
+            let r = mixed[i] - speech[i]
+            acc += r * r
+            i += 1
+        }
+        return acc / Float(mixed.count)
+    }
+
+    func testLevelsMeasureVoicedFramesAndFloor() {
+        let speech = toneThenSilence(amplitude: 0.2)
+        let level = NoiseBank.levels(speech)
+        XCTAssertEqual(level.voiced, 0.02, accuracy: 1e-3)
+        XCTAssertEqual(level.floor, 0.0, accuracy: 1e-9)
+    }
+
+    func testBankReachesTargetSNROverVoicedFrames() {
         let bank = NoiseBank(clips: [tone(count: 8000, amplitude: 0.5, period: 41), []])
         XCTAssertEqual(bank.count, 1)
         XCTAssertEqual(bank.totalSeconds, 0.5, accuracy: 1e-6)
-        let speech = tone(count: 16000, amplitude: 0.2, period: 100)
-        var rng = SystemRandomNumberGenerator()
+        let speech = toneThenSilence(amplitude: 0.2)
+        let voiced = NoiseBank.levels(speech).voiced
+        var rng = SplitMix64(seed: 5)
         var mixedCount = 0
         var trial = 0
         while trial < 40 {
-            let mixed = bank.mix(speech, using: &rng)
-            var acc: Float = 0.0
-            var i = 0
-            while i < mixed.count {
-                let r = mixed[i] - speech[i]
-                acc += r * r
-                i += 1
-            }
-            let residualRMS = (acc / Float(mixed.count)).squareRoot()
-            if 1e-6 < residualRMS {
+            let noise = residualPower(bank.mix(speech, using: &rng), speech)
+            if 1e-12 < noise {
                 mixedCount += 1
-                let snr = 20.0 * log10(NoiseBank.rms(speech) / residualRMS)
+                // Pauses do not lower the reference: the SNR is against the tone, not the whole-utterance RMS.
+                let snr = 10.0 * log10(voiced / noise)
                 XCTAssertGreaterThanOrEqual(snr, bank.snrRange.lowerBound - 0.3)
                 XCTAssertLessThanOrEqual(snr, bank.snrRange.upperBound + 0.3)
             }
             trial += 1
         }
-        // Mixing probability is 0.5, so some of the 40 trials pass through unchanged.
-        XCTAssertGreaterThan(mixedCount, 5)
-        XCTAssertLessThan(mixedCount, 35)
+        // A clean recording is mixed with probability 0.7, so some of the 40 trials pass through unchanged.
+        XCTAssertGreaterThan(mixedCount, 15)
+        XCTAssertLessThan(mixedCount, 38)
+    }
+
+    func testNoiseAlreadyPresentCountsTowardTheTarget() {
+        var noiseRNG = SplitMix64(seed: 11)
+        var speech = toneThenSilence(amplitude: 0.2)
+        var floor = [Float](repeating: 0.0, count: speech.count)
+        var i = 0
+        while i < speech.count {
+            // Uniform noise of RMS 0.02: 0.0004 against the tone's 0.02, a 17 dB floor already in the recording.
+            floor[i] = Float.random(in: -0.0346...0.0346, using: &noiseRNG)
+            speech[i] += floor[i]
+            i += 1
+        }
+        let clip = tone(count: 8000, amplitude: 0.5, period: 41)
+        var rng = SplitMix64(seed: 2)
+        let quieter = NoiseBank(clips: [clip], probability: 1.0, recordedProbability: 1.0, snrRange: 25.0...25.0)
+        XCTAssertEqual(quieter.mix(speech, using: &rng), speech)
+        let louder = NoiseBank(clips: [clip], probability: 1.0, recordedProbability: 1.0, snrRange: 10.0...10.0)
+        let added = residualPower(louder.mix(speech, using: &rng), speech)
+        let level = NoiseBank.levels(speech)
+        // Only the missing part is added: about 0.02 / 10 - 0.0004 = 0.0016, not the full 0.002.
+        XCTAssertEqual(added, level.voiced / 10.0 - level.floor, accuracy: 2e-4)
+        XCTAssertLessThan(added, level.voiced / 10.0 * 0.9)
+        // A recording with its own background sound is mixed with `recordedProbability`, a clean one with `probability`.
+        let recordedOnly = NoiseBank(clips: [clip], probability: 0.0, recordedProbability: 1.0, snrRange: 10.0...10.0)
+        XCTAssertNotEqual(recordedOnly.mix(speech, using: &rng), speech)
+        let clean = toneThenSilence(amplitude: 0.2)
+        XCTAssertEqual(recordedOnly.mix(clean, using: &rng), clean)
     }
 
     func testOverlayAddsVoiceOnceAtItsOwnLevel() {

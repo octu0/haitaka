@@ -2,14 +2,6 @@ import XCTest
 @testable import Haitaka
 
 final class FeatureAugmenterTests: XCTestCase {
-    private struct SeededGenerator: RandomNumberGenerator {
-        var state: UInt64
-        mutating func next() -> UInt64 {
-            state = state &* 6364136223846793005 &+ 1442695040888963407
-            return state
-        }
-    }
-
     func testResampleChangesLengthAndKeepsShape() {
         var pcm = [Float](repeating: 0.0, count: 16000)
         var i = 0
@@ -26,47 +18,6 @@ final class FeatureAugmenterTests: XCTestCase {
         XCTAssertEqual(FeatureAugmenter.resample(pcm, speed: 1.0), pcm)
     }
 
-    func testSpecAugmentMasksWholeFramesAndMatchingBandsAcrossStack() {
-        let dim = StreamingFeatureFrontEnd.inputDim
-        let frames = 50
-        let features = [[Float]](repeating: [Float](repeating: 1.0, count: dim), count: frames)
-        var rng = SeededGenerator(state: 7)
-        let out = FeatureAugmenter.specAugment(features, using: &rng)
-        XCTAssertEqual(out.count, frames)
-        var maskedFrames = 0
-        var bandZeroPattern: [Bool]? = nil
-        var t = 0
-        while t < frames {
-            if out[t].allSatisfy({ $0 == 0.0 }) {
-                maskedFrames += 1
-            } else {
-                // Frequency masks zero the same bands in the smoothed mel and delta of every hop.
-                let mel = StreamingFeatureFrontEnd.melChannels
-                let tap = StreamingFeatureFrontEnd.tapDim
-                var pattern = [Bool](repeating: false, count: mel)
-                var b = 0
-                while b < mel {
-                    pattern[b] = out[t][b] == 0.0
-                    var s = 0
-                    while s < 4 {
-                        XCTAssertEqual(out[t][s * tap + b] == 0.0, pattern[b], "ホップ \(s) の平滑メル帯 \(b) が揃っていない")
-                        XCTAssertEqual(out[t][s * tap + mel + b] == 0.0, pattern[b], "ホップ \(s) の差分帯 \(b) が揃っていない")
-                        s += 1
-                    }
-                    b += 1
-                }
-                if let previous = bandZeroPattern {
-                    XCTAssertEqual(previous, pattern, "周波数マスクがフレームで変わっている")
-                }
-                bandZeroPattern = pattern
-            }
-            t += 1
-        }
-        XCTAssertLessThanOrEqual(maskedFrames, FeatureAugmenter.timeMasks * min(FeatureAugmenter.maxTimeMaskFrames, frames / 10))
-        let maskedBands = bandZeroPattern?.filter { $0 }.count ?? 0
-        XCTAssertLessThanOrEqual(maskedBands, FeatureAugmenter.frequencyMasks * FeatureAugmenter.maxFrequencyMaskBands)
-    }
-
     func testAugmentationIsSeededByPathAndEpoch() {
         var pcm = [Float](repeating: 0.0, count: 16000)
         var i = 0
@@ -74,7 +25,7 @@ final class FeatureAugmenterTests: XCTestCase {
             pcm[i] = sin(Float(i) * 0.02)
             i += 1
         }
-        let augmenter = FeatureAugmenter(speed: true, specAugment: false)
+        let augmenter = FeatureAugmenter(speed: true)
         let transform = augmenter.pcmTransform!
         XCTAssertEqual(transform("a.wav", pcm), transform("a.wav", pcm))
         XCTAssertNotEqual(transform("a.wav", pcm).count, transform("b.wav", pcm).count)
@@ -84,18 +35,31 @@ final class FeatureAugmenterTests: XCTestCase {
         XCTAssertNotEqual(FeatureAugmenter.seed(forPath: "a.wav"), FeatureAugmenter.seed(forPath: "b.wav"))
     }
 
+    func testRepeatedRowsGetDifferentKeys() {
+        XCTAssertNotEqual(FeatureAugmenter.key(path: "a.wav", index: 3), FeatureAugmenter.key(path: "a.wav", index: 7))
+        let augmenter = FeatureAugmenter(speed: true)
+        var differs = false
+        var index = 1
+        while index < 20 {
+            let first = augmenter.speedFactor(path: FeatureAugmenter.key(path: "a.wav", index: 0))
+            if first != augmenter.speedFactor(path: FeatureAugmenter.key(path: "a.wav", index: index)) {
+                differs = true
+            }
+            index += 1
+        }
+        XCTAssertTrue(differs)
+    }
+
     func testDisabledAugmenterHasNoHooks() {
-        let off = FeatureAugmenter(speed: false, specAugment: false)
+        let off = FeatureAugmenter(speed: false)
         XCTAssertNil(off.pcmTransform)
-        XCTAssertNil(off.featureTransform)
-        let on = FeatureAugmenter(speed: true, specAugment: true)
+        let on = FeatureAugmenter(speed: true)
         XCTAssertNotNil(on.pcmTransform)
-        XCTAssertNotNil(on.featureTransform)
     }
 
     /// Batches are formed on the predicted perturbed length, so it must match the features of the perturbed audio.
     func testPredictedFrameCountMatchesPerturbedFeatures() {
-        let augmenter = FeatureAugmenter(speed: true, specAugment: false)
+        let augmenter = FeatureAugmenter(speed: true)
         var pcm = [Float](repeating: 0.0, count: 16000 * 3)
         var i = 0
         while i < pcm.count {
@@ -113,6 +77,6 @@ final class FeatureAugmenterTests: XCTestCase {
             }
         }
         XCTAssertLessThanOrEqual(worst, 1)
-        XCTAssertEqual(FeatureAugmenter(speed: false, specAugment: false).frameCount(frames, path: "/a/x.wav"), frames)
+        XCTAssertEqual(FeatureAugmenter(speed: false).frameCount(frames, path: "/a/x.wav"), frames)
     }
 }

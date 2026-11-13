@@ -51,25 +51,21 @@ public final class SpeechDataset: @unchecked Sendable {
         }
     }
 
-    /// `pcmTransform` runs on 16 kHz PCM before feature extraction (speed perturbation, noise mixing) and
-    /// `featureTransform` on the extracted features (SpecAugment). Both are training-only.
+    /// `pcmTransform` runs on 16 kHz PCM before feature extraction (speed perturbation, noise mixing). It is
+    /// training-only and receives `key` (the path unless given), which seeds the augmentation.
     public static func loadFeatures(
         path: String,
-        pcmTransform: ((String, [Float]) -> [Float])? = nil,
-        featureTransform: ((String, [[Float]]) -> [[Float]])? = nil
+        key: String? = nil,
+        pcmTransform: ((String, [Float]) -> [Float])? = nil
     ) -> (pcm: [Float], features: [[Float]]) {
         guard let wav = loadWavFile(path: path) else {
             return ([], [])
         }
         var pcm16k = resampleTo16k(pcmData: wav.pcmData, sampleRate: wav.sampleRate)
         if let transform = pcmTransform {
-            pcm16k = transform(path, pcm16k)
+            pcm16k = transform(key ?? path, pcm16k)
         }
-        var features = extractFeaturesFromPCM(pcmData: pcm16k)
-        if let transform = featureTransform {
-            features = transform(path, features)
-        }
-        return (pcm16k, features)
+        return (pcm16k, extractFeaturesFromPCM(pcmData: pcm16k))
     }
 
     /// Builds the dataset from manifest pairs. Utterances that yield no feature frames are dropped.

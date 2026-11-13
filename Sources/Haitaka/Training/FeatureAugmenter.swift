@@ -1,22 +1,12 @@
 import Foundation
 
-/// Training-only augmentation: speed perturbation and SpecAugment.
+/// Training-only PCM augmentation: speed perturbation, then background noise and read-aloud bot voices.
 ///
-/// - Speed perturbation resamples PCM by 0.9-1.1x with linear interpolation (pitch shifts too, as in Kaldi).
-/// - SpecAugment zeroes time spans (frames) and frequency bands (mel bands). Each frame stacks `stack` hops of
-///   [smoothed mel 64 + delta 64] at 10 ms, so a frequency mask covers the same band in every hop and in both halves.
+/// Speed perturbation resamples PCM by 0.9-1.1x with linear interpolation (pitch shifts too, as in Kaldi).
 public final class FeatureAugmenter: @unchecked Sendable {
     public static let speedRange: ClosedRange<Float> = 0.9...1.1
-    /// Number of time masks; each is at most the smaller of the frame cap and the ratio of the sequence length.
-    public static let timeMasks = 2
-    public static let maxTimeMaskFrames = 20
-    public static let maxTimeMaskRatio: Float = 0.1
-    /// Number of frequency masks and the maximum width in mel bands (out of 64).
-    public static let frequencyMasks = 2
-    public static let maxFrequencyMaskBands = 12
 
     public let speed: Bool
-    public let specAugment: Bool
     public let noiseBank: NoiseBank?
     /// Read-aloud bot voices laid over the utterance after the background noise (`NoiseBank.voice`).
     public let voiceBank: NoiseBank?
@@ -24,11 +14,16 @@ public final class FeatureAugmenter: @unchecked Sendable {
     /// training loop still gives every utterance a different augmentation each epoch by changing the salt.
     public var epochSalt: UInt64 = 0
 
-    public init(speed: Bool, specAugment: Bool, noiseBank: NoiseBank? = nil, voiceBank: NoiseBank? = nil) {
+    public init(speed: Bool, noiseBank: NoiseBank? = nil, voiceBank: NoiseBank? = nil) {
         self.speed = speed
-        self.specAugment = specAugment
         self.noiseBank = noiseBank
         self.voiceBank = voiceBank
+    }
+
+    /// Augmentation key of a manifest row. A manifest may list the same path more than once (data repeated to weight
+    /// it), and each row should hear different noise, so the row index is part of the key.
+    public static func key(path: String, index: Int) -> String {
+        return "\(path)#\(index)"
     }
 
     /// FNV-1a hash of the path: the per-utterance part of the augmentation seed.
@@ -47,16 +42,6 @@ public final class FeatureAugmenter: @unchecked Sendable {
             return nil
         }
         return { path, pcm in self.transformPCM(path: path, pcm) }
-    }
-
-    public var featureTransform: ((String, [[Float]]) -> [[Float]])? {
-        if specAugment != true {
-            return nil
-        }
-        return { path, features in
-            var rng = SplitMix64(seed: (Self.seed(forPath: path) ^ self.epochSalt) &+ 1)
-            return Self.specAugment(features, using: &rng)
-        }
     }
 
     /// The speed factor this epoch's PCM transform applies to the utterance (1 without speed perturbation). It is the
@@ -112,64 +97,6 @@ public final class FeatureAugmenter: @unchecked Sendable {
                 out[i] = pcm[base] * (1.0 - frac) + pcm[base + 1] * frac
             }
             i += 1
-        }
-        return out
-    }
-
-    /// Applies SpecAugment with random mask positions and widths; masked values are 0.
-    public static func specAugment<G: RandomNumberGenerator>(_ features: [[Float]], using rng: inout G) -> [[Float]] {
-        let frames = features.count
-        if frames == 0 {
-            return features
-        }
-        let dim = features[0].count
-        let tapDim = StreamingFeatureFrontEnd.tapDim
-        let mel = StreamingFeatureFrontEnd.melChannels
-        let stack = max(1, dim / tapDim)
-        var out = features
-
-        let maxTime = min(maxTimeMaskFrames, max(1, Int(Float(frames) * maxTimeMaskRatio)))
-        var m = 0
-        while m < timeMasks {
-            let length = Int.random(in: 0...maxTime, using: &rng)
-            if 0 < length && length < frames {
-                let start = Int.random(in: 0...(frames - length), using: &rng)
-                var t = start
-                while t < start + length {
-                    out[t] = [Float](repeating: 0.0, count: dim)
-                    t += 1
-                }
-            }
-            m += 1
-        }
-
-        m = 0
-        while m < frequencyMasks {
-            let bands = Int.random(in: 0...maxFrequencyMaskBands, using: &rng)
-            if 0 < bands && bands < mel {
-                let startBand = Int.random(in: 0...(mel - bands), using: &rng)
-                var t = 0
-                while t < frames {
-                    var s = 0
-                    while s < stack {
-                        var b = startBand
-                        while b < startBand + bands {
-                            let melIndex = s * tapDim + b
-                            let deltaIndex = s * tapDim + mel + b
-                            if melIndex < dim {
-                                out[t][melIndex] = 0.0
-                            }
-                            if deltaIndex < dim {
-                                out[t][deltaIndex] = 0.0
-                            }
-                            b += 1
-                        }
-                        s += 1
-                    }
-                    t += 1
-                }
-            }
-            m += 1
         }
         return out
     }
