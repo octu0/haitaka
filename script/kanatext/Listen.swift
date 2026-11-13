@@ -346,7 +346,7 @@ func runListen(options: [String: [String]], positional: [String]) throws {
     if let bankPath = options["--noise-bank"]?.first {
         noiseBank = try NoiseBank(manifestPath: bankPath)
     }
-    let augmenter = FeatureAugmenter(speed: false, noiseBank: noiseBank)
+    let augmenter = FeatureAugmenter(noiseBank: noiseBank)
     let loaded = readListenSamples(positional[0])
     let samples = loaded.filter { s in
         s.text.isEmpty != true && Double(s.text.count) <= ListenDefaults.maxCharsPerFrame * Double(s.frames)

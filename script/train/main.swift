@@ -198,8 +198,7 @@ if voiceBankPath.isEmpty != true {
     voiceBank = bank
     print("voice bank: \(voiceBankPath) (\(bank.count) clips, \(String(format: "%.1f", bank.totalSeconds / 60.0)) min; probability \(bank.probability), SNR \(bank.snrRange.lowerBound)-\(bank.snrRange.upperBound) dB, placed once)")
 }
-let augmenter = FeatureAugmenter(speed: true, noiseBank: noiseBank, voiceBank: voiceBank)
-print("speed perturbation: \(FeatureAugmenter.speedRange.lowerBound)-\(FeatureAugmenter.speedRange.upperBound)x")
+let augmenter = FeatureAugmenter(noiseBank: noiseBank, voiceBank: voiceBank)
 
 if datasetPath.isEmpty {
     print("error: specify a manifest (JSONL). See train --help.")
@@ -425,12 +424,11 @@ if 0 < epochs {
         print("  excluded as too long: \(tooLongCount) (over \(Defaults.maxTrainFrames) frames)")
     }
 
-    // Batches formed on the unperturbed lengths size the learning-rate schedule; each epoch re-forms them.
+    // Batches are formed from length-sorted utterances once; their order is shuffled every epoch.
     let lengthSortedIndices = feasibleIndices.sorted { a, b in
         return dataset.frameCount(at: a) < dataset.frameCount(at: b)
     }
-    // Frame counts the batches are formed on: the utterance lengths, then each epoch's speed-perturbed lengths.
-    var epochFrames = (0..<dataset.count).map { dataset.frameCount(at: $0) }
+    let frameCounts = (0..<dataset.count).map { dataset.frameCount(at: $0) }
     // Activation memory grows with utterances × padded frames × width, so batches are capped by that product.
     let widthRatio = Double(mlxNetwork.modelDim) / Double(HawkShape.defaultModelDim)
     let frameBudget = Int(Double(batchSize * Defaults.fullBatchFrames) / widthRatio)
@@ -439,13 +437,13 @@ if 0 < epochs {
         var current: [Int] = []
         var maxFrames = 0
         for idx in order {
-            maxFrames = max(maxFrames, epochFrames[idx])
+            maxFrames = max(maxFrames, frameCounts[idx])
             let padded = ((maxFrames + 31) / 32) * 32
             let fits = (current.count + 1) * padded <= frameBudget
             if current.isEmpty != true && (current.count == batchSize || fits != true) {
                 groups.append(current)
                 current = []
-                maxFrames = epochFrames[idx]
+                maxFrames = frameCounts[idx]
             }
             current.append(idx)
         }
@@ -462,7 +460,7 @@ if 0 < epochs {
     func paddedFrameCount(of group: [Int]) -> Int {
         var maxFrames = 0
         for idx in group {
-            maxFrames = max(maxFrames, epochFrames[idx])
+            maxFrames = max(maxFrames, frameCounts[idx])
         }
         return ((maxFrames + 31) / 32) * 32
     }
@@ -533,15 +531,9 @@ if 0 < epochs {
     while ep <= epochs {
         let epStartTime = CFAbsoluteTimeGetCurrent()
         augmenter.epochSalt = UInt64(ep)
-        epochFrames = (0..<dataset.count).map { augmenter.frameCount(dataset.frameCount(at: $0), path: FeatureAugmenter.key(path: dataset.metaSamples[$0].path, index: $0)) }
-        let epochIndices = feasibleIndices.filter { ctcMinimumFrames(allTargets[$0]) <= epochFrames[$0] }
-        print("  speed perturbation: \(feasibleIndices.count - epochIndices.count) utterances CTC-infeasible this epoch")
         if 1 < ep {
-            let jittered = epochIndices.map { idx in (key: epochFrames[idx] + Int(batchOrder.next() % 17) - 8, idx: idx) }
+            let jittered = feasibleIndices.map { idx in (key: frameCounts[idx] + Int(batchOrder.next() % 17) - 8, idx: idx) }
             batchGroups = batches(jittered.sorted { a, b in a.key < b.key }.map { $0.idx })
-        }
-        if ep == 1 {
-            batchGroups = batches(epochIndices.sorted { a, b in epochFrames[a] < epochFrames[b] })
         }
         batchGroups.shuffle(using: &batchOrder)
         groupBucketsWithinWindows(&batchGroups, window: Defaults.bucketRunWindow)
