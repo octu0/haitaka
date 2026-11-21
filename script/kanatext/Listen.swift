@@ -11,7 +11,8 @@ import MLXOptimizers
 //                   [-e epochs] [--english-dict <cmudict>] [--kana-lm <kana text>] [--noise-bank <jsonl>]
 //                   [--eval <manifest.jsonl>]... [<train manifest.jsonl>]
 // kana: the kanatext layers on recognized kana; audio: no kana, the decoder attends to the frames; both: kana and
-// frames, the frame attention starting as the identity. -e 0 only evaluates the initial model.
+// frames, the frame attention starting as the identity, with spans of the training kana masked so that the decoder
+// has to take them from the frames (evaluation reads the kana unmasked). -e 0 only evaluates the initial model.
 // With kana, the utterance is split into units at punctuation as in kanatext: each unit's text ends with eos and
 // attends to its own kana, while the frame attention sees the whole utterance. Training pairs the greedy CTC kana's
 // units with the text's when their counts match, and otherwise the reference kana's (from --english-dict, which
@@ -28,6 +29,10 @@ enum ListenDefaults {
     static let workers = 8
     static let cacheLimitBytes = 8 << 30
     static let maxCharsPerFrame = 0.5
+    /// Kana masking in training with both kana and frames: spans of 3 kana starting with probability 0.1 (about a
+    /// quarter of the kana) become `unknown`, to be taken from the audio.
+    static let maskStart = 0.1
+    static let maskSpan = 3
     static let logEvery = 500
 }
 
@@ -390,6 +395,7 @@ func runListen(options: [String: [String]], positional: [String]) throws {
         return [MLXKanaTextModel.loss(logits: logits, targets: a[2], smoothing: Defaults.smoothing)]
     }
     var order = SplitMix64(seed: Defaults.seed)
+    var masking = SplitMix64(seed: Defaults.seed ^ 0x6B61_6E61)
     var step = 0
     var best = Double.greatestFiniteMagnitude
     var ep = 1
@@ -400,6 +406,8 @@ func runListen(options: [String: [String]], positional: [String]) throws {
         var lossSum: Float = 0.0
         var windowSum: Float = 0.0
         var recognizedUtterances = 0
+        var maskedKana = 0
+        var sourceKana = 0
         let prefetch = ListenFeatures(count: 0)
         prefetch.items = listenFeatures(samples, batches[0], augmenter: augmenter)
         var bi = 0
@@ -422,7 +430,14 @@ func runListen(options: [String: [String]], positional: [String]) throws {
                 var i = 0
                 while i < batches[bi].count {
                     let index = batches[bi][i]
-                    let (chunk, recognized) = listenChunk(recognized: kana[i], reference: referenceKana[index], text: samples[index].text, vocabulary)
+                    let (paired, recognized) = listenChunk(recognized: kana[i], reference: referenceKana[index], text: samples[index].text, vocabulary)
+                    var chunk = paired
+                    if 0 < shape.audioDim {
+                        let (source, count) = vocabulary.masked(chunk.source, start: ListenDefaults.maskStart, span: ListenDefaults.maskSpan, using: &masking)
+                        chunk.source = source
+                        maskedKana += count
+                    }
+                    sourceKana += chunk.source.count
                     chunks.append(chunk)
                     if recognized {
                         recognizedUtterances += 1
@@ -476,6 +491,9 @@ func runListen(options: [String: [String]], positional: [String]) throws {
                      CFAbsoluteTimeGetCurrent() - start, MLX.GPU.peakMemory >> 20))
         if shape.kanaInput {
             print("  units from recognized kana in \(recognizedUtterances) of \(samples.count) utterances (the rest from reference kana)")
+        }
+        if 0 < maskedKana {
+            print(String(format: "  masked %d of %d kana (%.1f%%)", maskedKana, sourceKana, 100.0 * Double(maskedKana) / Double(max(1, sourceKana))))
         }
         let selection = try evaluateAll(outDir + "/ep\(ep)")
         try saveModel(model, vocabulary: vocabulary, to: outDir + "/ep\(ep)")

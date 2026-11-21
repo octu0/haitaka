@@ -80,6 +80,30 @@ public struct KanaTextVocabulary: Codable, Sendable {
     }
 
     /// Stops at the end token; unknown characters are dropped.
+    /// Input ids with spans of `span` kana replaced by `unknown`, each span starting at a kana with probability
+    /// `start`. Punctuation is kept, as it delimits the units. Returns the ids and how many were masked.
+    public func masked(_ ids: [Int], start: Double, span: Int, using rng: inout SplitMix64) -> ([Int], Int) {
+        let marks = Set(encodeInput(String(Array(KanaTextUnits.kanaMarks))))
+        var out = ids
+        var remaining = 0
+        var count = 0
+        var i = 0
+        while i < out.count {
+            if marks.contains(out[i]) != true {
+                if remaining == 0 && Double(rng.next() >> 11) / Double(UInt64(1) << 53) < start {
+                    remaining = span
+                }
+                if 0 < remaining {
+                    out[i] = Self.unknown
+                    remaining -= 1
+                    count += 1
+                }
+            }
+            i += 1
+        }
+        return (out, count)
+    }
+
     public func decodeOutput(_ ids: [Int]) -> String {
         var s = ""
         for id in ids {

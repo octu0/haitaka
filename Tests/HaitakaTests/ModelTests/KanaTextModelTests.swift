@@ -29,6 +29,31 @@ final class KanaTextModelTests: XCTestCase {
         XCTAssertEqual(units[0].text, "あい")
     }
 
+    /// Masking hides whole spans of kana, keeps the punctuation, covers about the expected share and is seeded.
+    func testKanaMaskingHidesSpansButKeepsPunctuation() {
+        let vocabulary = KanaTextVocabulary(pairs: [(kana: "あいうえお、かきくけこ。", text: "あ")])
+        let ids = vocabulary.encodeInput(String(repeating: "あいうえお、かきくけこ。", count: 200))
+        var rng = SplitMix64(seed: 7)
+        let (masked, count) = vocabulary.masked(ids, start: 0.1, span: 3, using: &rng)
+        XCTAssertEqual(masked.count, ids.count)
+        XCTAssertEqual(count, masked.filter { $0 == KanaTextVocabulary.unknown }.count)
+        let marks = Set(vocabulary.encodeInput("、。"))
+        var i = 0
+        while i < ids.count {
+            if marks.contains(ids[i]) {
+                XCTAssertEqual(masked[i], ids[i])
+            }
+            i += 1
+        }
+        let share = Double(count) / Double(ids.filter { marks.contains($0) != true }.count)
+        XCTAssertLessThan(0.18, share)
+        XCTAssertLessThan(share, 0.33)
+        var again = SplitMix64(seed: 7)
+        XCTAssertEqual(vocabulary.masked(ids, start: 0.1, span: 3, using: &again).0, masked)
+        var none = SplitMix64(seed: 7)
+        XCTAssertEqual(vocabulary.masked(ids, start: 0.0, span: 3, using: &none).1, 0)
+    }
+
     func testRepetitionCountsCopiesOfTheTailSpan() {
         let t = KanaTextRepetition.tail([9, 1, 2, 3, 1, 2, 3, 1, 2, 3], end: 10)
         XCTAssertEqual(t.period, 3)

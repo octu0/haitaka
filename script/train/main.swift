@@ -61,6 +61,7 @@ var datasetPath = ""
 var englishDictPath = ""
 var noiseBankPath = ""
 var voiceBankPath = ""
+var cleanDatasets: Set<String> = []
 var dictTextPaths: [String] = []
 var kanaLMPath = ""
 var evalDumpPath = ""
@@ -85,6 +86,7 @@ while argIdx < args.count {
         print("  --english-dict <path>              English pronunciation dictionary (CMU format) [required]")
         print("  --noise-bank <jsonl>               Manifest of noise clips mixed in during training")
         print("  --voice-bank <jsonl>               Manifest of read-aloud bot voices laid over utterances (left out of the labels)")
+        print("  --clean-dataset <dir name>         Directory name of a dataset of clean recordings (repeatable). When given, only these rows get noise and bot voices, always as clean recordings; other rows are left as recorded")
         print("  --dict-text <path>                 Text added only to the kana-kanji dictionary (.txt/.srt or a directory; repeatable)")
         print("  --kana-lm <path>                   Kana text, one sentence per line (kanalm output). Fused into the eval CTC beam search as an n-gram LM")
         print("  --eval-dump <jsonl>                Write per-utterance eval results")
@@ -135,6 +137,11 @@ while argIdx < args.count {
     case "--voice-bank":
         if (argIdx + 1) < args.count {
             voiceBankPath = args[argIdx + 1]
+            argIdx += 1
+        }
+    case "--clean-dataset":
+        if (argIdx + 1) < args.count {
+            cleanDatasets.insert(args[argIdx + 1])
             argIdx += 1
         }
     case "--dict-text":
@@ -198,7 +205,10 @@ if voiceBankPath.isEmpty != true {
     voiceBank = bank
     print("voice bank: \(voiceBankPath) (\(bank.count) clips, \(String(format: "%.1f", bank.totalSeconds / 60.0)) min; probability \(bank.probability), SNR \(bank.snrRange.lowerBound)-\(bank.snrRange.upperBound) dB, placed once)")
 }
-let augmenter = FeatureAugmenter(noiseBank: noiseBank, voiceBank: voiceBank)
+let augmenter = FeatureAugmenter(noiseBank: noiseBank, voiceBank: voiceBank, cleanDatasets: cleanDatasets)
+if cleanDatasets.isEmpty != true {
+    print("clean datasets (the only rows augmented): \(cleanDatasets.sorted().joined(separator: ", "))")
+}
 
 if datasetPath.isEmpty {
     print("error: specify a manifest (JSONL). See train --help.")
