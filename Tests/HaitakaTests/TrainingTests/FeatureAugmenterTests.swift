@@ -40,24 +40,6 @@ final class FeatureAugmenterTests: XCTestCase {
         XCTAssertNotEqual(transform(first, pcm), transform(second, pcm))
     }
 
-    func testCleanDatasetsAreTheOnlyRowsAugmentedAndCountAsClean() {
-        var rng = SplitMix64(seed: 3)
-        let noise = (0..<8000).map { _ in Float.random(in: -1.0...1.0, using: &rng) }
-        // A recording counted as carrying background sound is never mixed, so any mixing comes from the clean flag.
-        let bank = NoiseBank(clips: [noise], probability: 1.0, recordedProbability: 0.0)
-        let augmenter = FeatureAugmenter(noiseBank: bank, cleanDatasets: ["clean_wav"])
-        let transform = augmenter.pcmTransform!
-        // A floor about 31 dB under the tone: under the 40 dB clean margin, yet quieter than any target SNR.
-        var floorRNG = SplitMix64(seed: 5)
-        let pcm = toneThenSilence().map { $0 + Float.random(in: -0.01...0.01, using: &floorRNG) }
-        XCTAssertEqual(FeatureAugmenter(noiseBank: bank).pcmTransform!("/data/clean_wav/a.wav#0", pcm), pcm)
-        XCTAssertNotEqual(transform("/data/clean_wav/a.wav#0", pcm), pcm)
-        XCTAssertEqual(transform("/data/stream_wav/a.wav#0", pcm), pcm)
-        XCTAssertEqual(transform("/data/clean_wav_extra/a.wav#0", pcm), pcm)
-        XCTAssertTrue(augmenter.isInCleanDataset("/data/clean_wav/sub/a.wav"))
-        XCTAssertFalse(augmenter.isInCleanDataset("/data/other/a.wav"))
-    }
-
     func testAugmenterWithoutBanksHasNoHook() {
         XCTAssertNil(FeatureAugmenter().pcmTransform)
         XCTAssertNotNil(alwaysNoisy().pcmTransform)

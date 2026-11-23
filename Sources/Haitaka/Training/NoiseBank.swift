@@ -101,18 +101,13 @@ public final class NoiseBank: @unchecked Sendable {
         return mix(speech, using: &rng)
     }
 
-    /// `clean` set by the caller decides the probability; nil measures it from the noise floor (`cleanFloorDB`).
-    public func mix<G: RandomNumberGenerator>(_ speech: [Float], clean: Bool? = nil, using rng: inout G) -> [Float] {
+    public func mix<G: RandomNumberGenerator>(_ speech: [Float], using rng: inout G) -> [Float] {
         if clips.isEmpty || speech.isEmpty {
             return speech
         }
         let level = Self.levels(speech)
-        var isClean = level.floor * powf(10.0, Self.cleanFloorDB / 10.0) <= level.voiced
-        if let given = clean {
-            isClean = given
-        }
         var chance = recordedProbability
-        if isClean {
+        if level.floor * powf(10.0, Self.cleanFloorDB / 10.0) <= level.voiced {
             chance = probability
         }
         if chance < Double.random(in: 0.0..<1.0, using: &rng) {
