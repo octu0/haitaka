@@ -7,6 +7,9 @@ import MLXOptimizers
 public final class MLXHawkTrainer: @unchecked Sendable {
     public let network: MLXHawkNetwork
     public let optimizer: ArrayLRAdam
+    /// The per-label CTC loss is multiplied by this (the training data's mean label count), so the loss and the
+    /// gradient clipping keep the scale of a per-utterance loss.
+    public let meanLabelCount: Float
 
     /// Gradient norm of the most recent batch, before clipping.
     public private(set) var lastGradientNorm: Float = 0.0
@@ -25,8 +28,9 @@ public final class MLXHawkTrainer: @unchecked Sendable {
     /// to the learning rate here.
     private var adamSteps = 0
 
-    public init(network: MLXHawkNetwork, learningRate: Float) {
+    public init(network: MLXHawkNetwork, learningRate: Float, meanLabelCount: Float = 1.0) {
         self.network = network
+        self.meanLabelCount = meanLabelCount
         self.optimizer = ArrayLRAdam(learningRate: learningRate)
         let scaled = Self.cacheLimitBytes / max(1, network.modelDim / HawkShape.defaultModelDim)
         MLX.GPU.set(cacheLimit: max(Self.minCacheLimitBytes, scaled))
@@ -88,7 +92,8 @@ public final class MLXHawkTrainer: @unchecked Sendable {
                 hasSecondFinal: arrays[6],
                 inputLengths: arrays[7]
             )
-            return [MLXCTCLoss.loss(logits: model(arrays[0], frameCounts: arrays[7]), targets: ext)]
+            let perLabel = MLXCTCLoss.loss(logits: model(arrays[0], frameCounts: arrays[7]), targets: ext)
+            return [perLabel * MLXArray(self.meanLabelCount)]
         }
         let lg = valueAndGrad(model: network, lossFn)
         // The learning rate is passed as the last input so the compiled graph reads it as an argument, not a constant.

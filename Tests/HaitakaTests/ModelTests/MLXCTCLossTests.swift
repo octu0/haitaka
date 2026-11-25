@@ -63,12 +63,12 @@ final class MLXCTCLossTests: XCTestCase {
             )
             let actual = MLXCTCLoss.loss(logits: logits, targets: ext).item(Float.self)
 
-            XCTAssertEqual(actual, expected, accuracy: 1e-3,
+            XCTAssertEqual(actual, expected / Float(labels.count), accuracy: 1e-3,
                            "frames=\(frames) labels=\(labels) で不一致")
         }
     }
 
-    /// Samples of different lengths in one batch are computed independently.
+    /// Samples of different lengths in one batch are computed independently, and the batch loss is per label.
     func testBatchMatchesIndividualLosses() {
         let blankId = 0
         let vocab = 5
@@ -98,8 +98,9 @@ final class MLXCTCLossTests: XCTestCase {
         )
         let batchLoss = MLXCTCLoss.loss(logits: logits, targets: batchExt).item(Float.self)
 
-        // Must equal the mean of per-sample losses.
+        // Must equal the summed per-sample losses over the total label count.
         var sum: Float = 0.0
+        var labels = 0
         b = 0
         while b < samples.count {
             let single = logits[b..<(b + 1), 0..., 0...]
@@ -108,10 +109,11 @@ final class MLXCTCLossTests: XCTestCase {
                 frameCounts: [samples[b].frames],
                 blankId: blankId
             )
-            sum += MLXCTCLoss.loss(logits: single, targets: ext).item(Float.self)
+            sum += MLXCTCLoss.loss(logits: single, targets: ext).item(Float.self) * Float(samples[b].labels.count)
+            labels += samples[b].labels.count
             b += 1
         }
-        XCTAssertEqual(batchLoss, sum / Float(samples.count), accuracy: 1e-3)
+        XCTAssertEqual(batchLoss, sum / Float(labels), accuracy: 1e-3)
     }
 
     /// Infeasible utterances (more required labels than frames) are excluded from the batch mean.

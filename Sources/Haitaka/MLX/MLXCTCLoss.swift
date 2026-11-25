@@ -139,7 +139,8 @@ public enum MLXCTCLoss {
         return concatenated([head, alpha[0..., 0..<(length - k)]], axis: 1)
     }
 
-    /// Mean CTC negative log-likelihood over the batch.
+    /// CTC negative log-likelihood per label: the batch's summed negative log-likelihood over its total label count.
+    /// Every utterance in a batch weighs the same, and a batch of short utterances is not outweighed by one of long ones.
     ///
     /// - Parameters:
     ///   - logits: [B, T, V]
@@ -195,7 +196,8 @@ public enum MLXCTCLoss {
         // Exclude them from the mean so they do not blow up the loss and gradients.
         let feasible = logLikelihood .> MLXArray(negativeInfinity * 0.5)
         let safe = which(feasible, logLikelihood, MLXArray(Float(0.0)))
-        let count = maximum(sum(feasible.asType(.float32)), MLXArray(Float(1.0)))
-        return -sum(safe) / count
+        let labelCount = targets.finalIndex1.asType(.float32) * MLXArray(Float(0.5))
+        let totalLabels = maximum(sum(which(feasible, labelCount, MLXArray(Float(0.0)))), MLXArray(Float(1.0)))
+        return -sum(safe) / totalLabels
     }
 }

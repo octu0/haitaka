@@ -378,7 +378,15 @@ if 0 < epochs {
         mlxNetwork.importEncoder(from: weights)
     }
     print("  parameters \(mlxNetwork.exportWeights().parameterCount), batch \(batchSize)")
-    let trainer = MLXHawkTrainer(network: mlxNetwork, learningRate: Defaults.lrMax)
+    var labelSum = 0
+    var labelRows = 0
+    for targets in allTargets.prefix(sampleLimit) where targets.isEmpty != true {
+        labelSum += targets.count
+        labelRows += 1
+    }
+    let meanLabelCount = Float(labelSum) / Float(max(1, labelRows))
+    print("  mean label count: \(String(format: "%.1f", meanLabelCount)) (CTC loss per label times this)")
+    let trainer = MLXHawkTrainer(network: mlxNetwork, learningRate: Defaults.lrMax, meanLabelCount: meanLabelCount)
     var scheduler = CosineLRScheduler(lrMax: Defaults.lrMax, lrMin: 0.0)
     // Fine-tuning from trained weights anneals from lrMin to zero over the whole run, without warmup.
     if importedWeights != nil {
