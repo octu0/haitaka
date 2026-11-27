@@ -105,49 +105,74 @@ public final class SpeechDataset: @unchecked Sendable {
         return SpeechDataset(metaSamples: buffer.items.compactMap { $0 })
     }
 
-    /// Resamples to 16 kHz. 48 kHz uses a 3-tap box filter before decimation; other rates use linear interpolation.
+    /// Zero crossings on each side of the resampling kernel; the Blackman window stops the band at about -58 dB.
+    static let sincHalfCrossings = 16
+    /// Kernel table resolution: entries per zero crossing.
+    static let sincStepsPerCrossing = 512
+    /// Low-pass cutoff relative to the 8 kHz output Nyquist frequency (7.5 kHz).
+    static let sincCutoffRatio: Float = 0.9375
+    /// g(u) = sinc(u) · Blackman(u / K) for u in [0, K], sampled `sincStepsPerCrossing` times per zero crossing.
+    static let sincTable: [Float] = {
+        let total = sincHalfCrossings * sincStepsPerCrossing
+        var table = [Float](repeating: 0.0, count: total + 1)
+        table[0] = 1.0
+        var i = 1
+        while i <= total {
+            let u = Float(i) / Float(sincStepsPerCrossing)
+            let piU = Float.pi * u
+            let z = u / Float(sincHalfCrossings)
+            let window = 0.42 + 0.5 * cosf(Float.pi * z) + 0.08 * cosf(2.0 * Float.pi * z)
+            table[i] = sinf(piU) / piU * window
+            i += 1
+        }
+        return table
+    }()
+
+    /// Resamples to 16 kHz with a Blackman-windowed sinc low-pass (7.5 kHz cutoff), so content above the output
+    /// Nyquist frequency is removed instead of aliasing into the speech band. Each output sample is normalized by its
+    /// kernel weights, so the DC gain is exactly 1. 16 kHz input is returned unchanged.
     public static func resampleTo16k(pcmData: [Float], sampleRate: Int) -> [Float] {
         if sampleRate == 16000 || pcmData.isEmpty {
             return pcmData
         }
-
-        if sampleRate == 48000 {
-            let outCount = pcmData.count / 3
-            var out = [Float](repeating: 0.0, count: outCount)
-            var m = 0
-            while m < outCount {
-                let srcIdx = m * 3
-                let s0 = pcmData[srcIdx]
-                var s1 = s0
-                if (srcIdx + 1) < pcmData.count {
-                    s1 = pcmData[srcIdx + 1]
-                }
-                var s2 = s1
-                if (srcIdx + 2) < pcmData.count {
-                    s2 = pcmData[srcIdx + 2]
-                }
-                out[m] = (s0 + s1 + s2) / 3.0
-                m += 1
-            }
-            return out
-        }
-
         let ratio = Float(sampleRate) / 16000.0
         let outCount = Int(Float(pcmData.count) / ratio)
         if outCount <= 0 {
             return []
         }
+        let cutoff = sincCutoffRatio / max(1.0, ratio)
+        let radius = Float(sincHalfCrossings) / cutoff
+        let tableScale = cutoff * Float(sincStepsPerCrossing)
+        let tableLimit = sincHalfCrossings * sincStepsPerCrossing
+        let inCount = pcmData.count
         var out = [Float](repeating: 0.0, count: outCount)
-        var m = 0
-        while m < outCount {
-            let srcPos = Float(m) * ratio
-            let i0 = Int(srcPos)
-            let i1 = min(pcmData.count - 1, i0 + 1)
-            let frac = srcPos - Float(i0)
-            if i0 < pcmData.count {
-                out[m] = (1.0 - frac) * pcmData[i0] + frac * pcmData[i1]
+        pcmData.withUnsafeBufferPointer { srcBuf in
+            sincTable.withUnsafeBufferPointer { tblBuf in
+                let src = srcBuf.baseAddress!
+                let tbl = tblBuf.baseAddress!
+                var m = 0
+                while m < outCount {
+                    let center = Float(m) * ratio
+                    let kStart = max(0, Int(ceilf(center - radius)))
+                    let kEnd = min(inCount - 1, Int(floorf(center + radius)))
+                    var acc: Float = 0.0
+                    var wSum: Float = 0.0
+                    var k = kStart
+                    while k <= kEnd {
+                        let idx = Int(abs(Float(k) - center) * tableScale)
+                        if idx <= tableLimit {
+                            let w = tbl[idx]
+                            acc += src[k] * w
+                            wSum += w
+                        }
+                        k += 1
+                    }
+                    if 1e-12 < wSum {
+                        out[m] = acc / wSum
+                    }
+                    m += 1
+                }
             }
-            m += 1
         }
         return out
     }

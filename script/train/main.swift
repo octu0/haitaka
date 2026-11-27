@@ -35,6 +35,9 @@ enum Defaults {
     /// get fewer utterances, and wider models proportionally fewer: peak memory on the longest utterances stays
     /// near 19 GB for 1×, 2× and 4× width.
     static let fullBatchFrames = 512
+    /// Width ratio beyond which the frame budget stops shrinking, so long utterances at 4× width are not split into
+    /// many small batches (each one a full Adam step).
+    static let maxBudgetWidthRatio = 2.0
     /// Seeds weight initialization, batch order and augmentation, so two runs differ only by their data.
     static let seed: UInt64 = 1
     /// Batches within this window are reordered so equal padded lengths run back to back; compiled steps
@@ -439,7 +442,7 @@ if 0 < epochs {
     let frameCounts = (0..<dataset.count).map { dataset.frameCount(at: $0) }
     // Activation memory grows with utterances × padded frames × width, so batches are capped by that product.
     let widthRatio = Double(mlxNetwork.modelDim) / Double(HawkShape.defaultModelDim)
-    let frameBudget = Int(Double(batchSize * Defaults.fullBatchFrames) / widthRatio)
+    let frameBudget = Int(Double(batchSize * Defaults.fullBatchFrames) / min(Defaults.maxBudgetWidthRatio, widthRatio))
     func batches(_ order: [Int]) -> [[Int]] {
         var groups: [[Int]] = []
         var current: [Int] = []
@@ -476,8 +479,14 @@ if 0 < epochs {
         var start = 0
         while start < groups.count {
             let end = min(start + window, groups.count)
-            let keyed = groups[start..<end].map { group in (key: paddedFrameCount(of: group), group: group) }
-            groups.replaceSubrange(start..<end, with: keyed.sorted { a, b in a.key < b.key }.map { $0.group })
+            let keyed = groups[start..<end].map { group in (frames: paddedFrameCount(of: group), count: group.count, group: group) }
+            let sorted = keyed.sorted { a, b in
+                if a.frames != b.frames {
+                    return a.frames < b.frames
+                }
+                return a.count < b.count
+            }
+            groups.replaceSubrange(start..<end, with: sorted.map { $0.group })
             start = end
         }
     }

@@ -22,7 +22,9 @@ public final class MLXHawkTrainer: @unchecked Sendable {
     /// grows without bound; a limit below one step's working set forces reallocation every step and slows training.
     /// Wider models get a proportionally smaller cache (down to `minCacheLimitBytes`) so cache plus activations fit.
     public static let cacheLimitBytes = 24 << 30
-    public static let minCacheLimitBytes = 6 << 30
+    public static let minCacheLimitBytes = 16 << 30
+    /// Decoupled weight decay on the weight matrices (see `ArrayLRAdam.weightDecay`).
+    public static let weightDecay: Float = 0.01
 
     /// Adam updates since the moments were last zeroed; ArrayLRAdam has no bias correction, so it is applied
     /// to the learning rate here.
@@ -31,7 +33,7 @@ public final class MLXHawkTrainer: @unchecked Sendable {
     public init(network: MLXHawkNetwork, learningRate: Float, meanLabelCount: Float = 1.0) {
         self.network = network
         self.meanLabelCount = meanLabelCount
-        self.optimizer = ArrayLRAdam(learningRate: learningRate)
+        self.optimizer = ArrayLRAdam(learningRate: learningRate, weightDecay: Self.weightDecay)
         let scaled = Self.cacheLimitBytes / max(1, network.modelDim / HawkShape.defaultModelDim)
         MLX.GPU.set(cacheLimit: max(Self.minCacheLimitBytes, scaled))
     }
