@@ -64,14 +64,14 @@ public final class MLXHawkTrainer: @unchecked Sendable {
         blankId: Int = 0,
         compiled: Bool = true
     ) -> Float {
-        // CTC is undefined for empty targets; skip those samples.
+        // An empty target (noise only) trains the all-blank path.
         var validFeatures: [[[Float]]] = []
         var validTargets: [[Int]] = []
         var frameCounts: [Int] = []
         var b = 0
         while b < featuresBatch.count {
             let frames = featuresBatch[b].count
-            if 0 < frames && targetsBatch[b].isEmpty != true {
+            if 0 < frames {
                 validFeatures.append(featuresBatch[b])
                 validTargets.append(targetsBatch[b])
                 frameCounts.append(frames)

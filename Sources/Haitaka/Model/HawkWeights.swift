@@ -20,7 +20,7 @@ public enum HawkShape {
     public static let attentionHeads = 8
     /// Key/value heads of the local attention; each serves attentionHeads / attentionKVHeads query heads
     /// (1: multi-query, a divisor of attentionHeads: grouped-query).
-    public static let attentionKVHeads = 1
+    public static let attentionKVHeads = 4
     /// Frames each query may look back over (2.56 s at 40 ms), the current frame included. Strictly causal.
     public static let attentionWindow = 64
 }

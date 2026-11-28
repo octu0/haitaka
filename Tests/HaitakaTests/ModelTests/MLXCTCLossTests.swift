@@ -149,4 +149,30 @@ final class MLXCTCLossTests: XCTestCase {
         XCTAssertEqual(mixedLoss, singleLoss, accuracy: 1e-3, "整列できない発話が損失の平均に混ざっている")
         XCTAssertLessThan(mixedLoss, 1e6)
     }
+
+    /// A noise-only utterance (no labels) is scored by the all-blank path and counts as one label.
+    func testEmptyTargetScoresTheAllBlankPath() {
+        let vocab = 4
+        let frames = 6
+        var flat = [Float](repeating: 0.0, count: 2 * frames * vocab)
+        var i = 0
+        while i < flat.count {
+            flat[i] = Float((i * 7) % 5) * 0.3
+            i += 1
+        }
+        let logits = MLXArray(flat, [2, frames, vocab])
+        let logProbs = logits - logSumExp(logits, axis: -1, keepDims: true)
+        var expected: Float = 0.0
+        var b = 0
+        while b < 2 {
+            var t = 0
+            while t < frames {
+                expected -= logProbs[b, t, 0].item(Float.self)
+                t += 1
+            }
+            b += 1
+        }
+        let empty = MLXCTCLoss.ExtendedTargets(targetsBatch: [[], []], frameCounts: [frames, frames], blankId: 0)
+        XCTAssertEqual(MLXCTCLoss.loss(logits: logits, targets: empty).item(Float.self), expected / 2.0, accuracy: 1e-3)
+    }
 }
