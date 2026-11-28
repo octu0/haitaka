@@ -148,13 +148,17 @@ public final class HawkNetwork: @unchecked Sendable {
         return x
     }
 
-    /// Causal multi-query attention over the last `attentionWindow` frames, then the gated MLP. [rows, modelDim].
+    /// Causal multi-query or grouped-query attention over the last `attentionWindow` frames, then the gated MLP.
+    /// [rows, modelDim]. Keys and values are cached as [rows, kvHeads, headDim].
     private func attend(block b: Int, input: [Float], state: State) -> [Float] {
         let w = weights
         let d = w.modelDim
         let m = w.mlpDim
         let heads = w.attentionHeads
         let hd = w.attentionHeadDim
+        let kv = w.attentionKVHeads
+        let group = heads / kv
+        let kvWidth = kv * hd
         let half = hd / 2
         let rows = input.count / d
         if rows <= 0 {
@@ -165,11 +169,11 @@ public final class HawkNetwork: @unchecked Sendable {
         var normed = [Float](repeating: 0.0, count: rows * d)
         Self.rmsNorm(x, aw.norm1, &normed, frames: rows, width: d)
         var q = [Float](repeating: 0.0, count: rows * heads * hd)
-        var k = [Float](repeating: 0.0, count: rows * hd)
-        var v = [Float](repeating: 0.0, count: rows * hd)
+        var k = [Float](repeating: 0.0, count: rows * kvWidth)
+        var v = [Float](repeating: 0.0, count: rows * kvWidth)
         Self.gemm(normed, aw.wQ, &q, m: rows, n: heads * hd, k: d)
-        Self.gemm(normed, aw.wK, &k, m: rows, n: hd, k: d)
-        Self.gemm(normed, aw.wV, &v, m: rows, n: hd, k: d)
+        Self.gemm(normed, aw.wK, &k, m: rows, n: kvWidth, k: d)
+        Self.gemm(normed, aw.wV, &v, m: rows, n: kvWidth, k: d)
         let start = state.attentionPosition[b]
         // Rotary positions; angles in Double so hours-long streams keep their relative phases.
         var cosines = [Float](repeating: 0.0, count: half)
@@ -198,10 +202,14 @@ public final class HawkNetwork: @unchecked Sendable {
                 rotate(&q, base: (t * heads + h) * hd)
                 h += 1
             }
-            rotate(&k, base: t * hd)
+            h = 0
+            while h < kv {
+                rotate(&k, base: (t * kv + h) * hd)
+                h += 1
+            }
             t += 1
         }
-        let cachedRows = state.attentionKeys[b].count / hd
+        let cachedRows = state.attentionKeys[b].count / kvWidth
         let keys = state.attentionKeys[b] + k
         let values = state.attentionValues[b] + v
         let cacheStart = start - cachedRows
@@ -219,10 +227,15 @@ public final class HawkNetwork: @unchecked Sendable {
                 let first = max(0, max(cacheStart, position - w.attentionWindow + 1))
                 let count = position - first + 1
                 let window = first - cacheStart
-                // scores [heads, count] = Q_t [heads, hd] · K_window^T
-                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, Int32(heads), Int32(count), Int32(hd),
-                            scale, qp.baseAddress! + t * heads * hd, Int32(hd), kp.baseAddress! + window * hd, Int32(hd),
-                            0.0, sp.baseAddress!, Int32(count))
+                // scores [group, count] = Q_t [group, hd] · K_window,g^T for each key/value head g
+                var g = 0
+                while g < kv {
+                    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, Int32(group), Int32(count), Int32(hd),
+                                scale, qp.baseAddress! + (t * heads + g * group) * hd, Int32(hd),
+                                kp.baseAddress! + window * kvWidth + g * hd, Int32(kvWidth),
+                                0.0, sp.baseAddress! + g * group * count, Int32(count))
+                    g += 1
+                }
                 var h = 0
                 while h < heads {
                     let row = sp.baseAddress! + h * count
@@ -238,16 +251,21 @@ public final class HawkNetwork: @unchecked Sendable {
                     vDSP_vsmul(row, 1, &inv, row, 1, vDSP_Length(count))
                     h += 1
                 }
-                // out_t [heads, hd] = P [heads, count] · V_window [count, hd]
-                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, Int32(heads), Int32(hd), Int32(count),
-                            1.0, sp.baseAddress!, Int32(count), vp.baseAddress! + window * hd, Int32(hd),
-                            0.0, op.baseAddress! + t * heads * hd, Int32(hd))
+                // out_t [group, hd] = P [group, count] · V_window,g [count, hd] for each key/value head g
+                g = 0
+                while g < kv {
+                    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, Int32(group), Int32(hd), Int32(count),
+                                1.0, sp.baseAddress! + g * group * count, Int32(count),
+                                vp.baseAddress! + window * kvWidth + g * hd, Int32(kvWidth),
+                                0.0, op.baseAddress! + (t * heads + g * group) * hd, Int32(hd))
+                    g += 1
+                }
                 t += 1
             }
         }}}}}
         let keep = min(w.attentionWindow - 1, cachedRows + rows)
-        state.attentionKeys[b] = Array(keys[((cachedRows + rows - keep) * hd)...])
-        state.attentionValues[b] = Array(values[((cachedRows + rows - keep) * hd)...])
+        state.attentionKeys[b] = Array(keys[((cachedRows + rows - keep) * kvWidth)...])
+        state.attentionValues[b] = Array(values[((cachedRows + rows - keep) * kvWidth)...])
         state.attentionPosition[b] = start + rows
         Self.gemm(out, aw.wO, &x, m: rows, n: d, k: heads * hd, beta: 1.0)
 

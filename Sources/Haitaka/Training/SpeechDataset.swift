@@ -177,21 +177,22 @@ public final class SpeechDataset: @unchecked Sendable {
         return out
     }
 
-    /// Offline feature extraction: the gain is fixed from the clip RMS, then every hop is pushed through
-    /// `StreamingFeatureFrontEnd`.
-    public static func extractFeaturesFromPCM(pcmData: [Float]) -> [[Float]] {
+    /// Offline feature extraction: the gain is fixed from the RMS of the first `rmsSampleCount` samples (the whole clip
+    /// by default), then every hop is pushed through `StreamingFeatureFrontEnd`.
+    public static func extractFeaturesFromPCM(pcmData: [Float], rmsSampleCount: Int? = nil) -> [[Float]] {
         let totalSamples = pcmData.count
         if totalSamples < 400 {
             return []
         }
 
+        let rmsCount = min(totalSamples, max(1, rmsSampleCount ?? totalSamples))
         var sumSquares: Float = 0.0
         var rIdx = 0
-        while rIdx < totalSamples {
+        while rIdx < rmsCount {
             sumSquares += pcmData[rIdx] * pcmData[rIdx]
             rIdx += 1
         }
-        let rms = sqrtf(sumSquares / Float(totalSamples))
+        let rms = sqrtf(sumSquares / Float(rmsCount))
         let front = StreamingFeatureFrontEnd()
         front.setGain(StreamingFeatureFrontEnd.gainForRMS(rms))
         front.beginUtterance()

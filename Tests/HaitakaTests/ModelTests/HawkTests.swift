@@ -158,17 +158,20 @@ final class HawkTests: XCTestCase {
     }
 
     /// Local attention blocks: chunked CPU inference with cached keys matches the MLX forward pass, with and
-    /// without lookahead, and for sequences longer than the window.
+    /// without lookahead, for sequences longer than the window, and for multi-query and grouped-query heads.
     func testForwardMatchesWithLocalAttention() {
-        for (convRight, chunk) in [(0, 5), (2, 3), (1, 64)] {
+        for (convRight, chunk, heads, kvHeads) in [(0, 5, 2, 1), (2, 3, 2, 1), (1, 64, 2, 1), (2, 3, 4, 2), (1, 5, 4, 4)] {
             let net = MLXHawkNetwork(inputDim: 12, modelDim: 16, rnnDim: 24, mlpDim: 32, heads: 3, convWidth: 4, convRight: convRight,
-                                     numLayers: 2, outputDim: 7, attentionAfter: [0, 1], attentionHeads: 2, attentionWindow: 9)
+                                     numLayers: 2, outputDim: 7, attentionAfter: [0, 1], attentionHeads: heads,
+                                     attentionKVHeads: kvHeads, attentionWindow: 9)
             let frames = 37
             let features = makeFeatures(frames: frames, dim: 12)
             let logits = net(MLXArray(features.flatMap { $0 }, [1, frames, 12]))
             let expected = logits - logSumExp(logits, axis: -1, keepDims: true)
             let weights = net.exportWeights()
             XCTAssertEqual(weights.attention.count, 2)
+            XCTAssertEqual(weights.attentionKVHeads, kvHeads)
+            assertClose(MLXHawkNetwork(weights: weights)(MLXArray(features.flatMap { $0 }, [1, frames, 12])), logits, 1e-5)
             XCTAssertEqual(weights.parameterCount, net.parameters().flattened().reduce(0) { $0 + $1.1.size })
             let got = HawkNetwork(weights: weights).logProbs(features: features, chunkFrames: chunk)
             XCTAssertEqual(got.count, frames)

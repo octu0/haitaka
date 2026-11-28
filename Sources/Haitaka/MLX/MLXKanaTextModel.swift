@@ -401,7 +401,7 @@ public final class MLXKanaTextModel: Module, @unchecked Sendable {
         let encoderBlocks = encoderLayers + encoderAttentionAfter.count
         encoder = (0..<encoderLayers).map { _ in hawk(encoderBlocks) }
         encoderAttention = encoderAttentionAfter.map { after in
-            MLXHawkAttentionLayer(after: after, modelDim: d, mlpDim: shape.mlpDim, heads: shape.heads,
+            MLXHawkAttentionLayer(after: after, modelDim: d, mlpDim: shape.mlpDim, heads: shape.heads, kvHeads: 1,
                                   window: shape.attentionWindow, residualScale: 1.0 / sqrt(Float(2 * encoderBlocks)))
         }
         encoderNorm = MLXArray.ones([d])

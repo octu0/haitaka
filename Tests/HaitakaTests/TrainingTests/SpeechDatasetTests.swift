@@ -63,4 +63,18 @@ final class SpeechDatasetTests: XCTestCase {
             XCTAssertLessThan(middleRMS(alias), 0.01, "11 kHz at \(rate) Hz")
         }
     }
+
+    /// Appended samples do not change the gain, so the utterance's own frames keep their features.
+    func testGainComesFromTheGivenSamples() {
+        var pcm = tone(440.0, rate: 16000, seconds: 0.5)
+        pcm += [Float](repeating: 0.0, count: 8000)
+        let plain = SpeechDataset.extractFeaturesFromPCM(pcmData: pcm)
+        let padded = SpeechDataset.extractFeaturesFromPCM(pcmData: pcm + [Float](repeating: 0.0, count: 8000), rmsSampleCount: pcm.count)
+        XCTAssertLessThan(plain.count, padded.count)
+        var f = 0
+        while f < plain.count - 1 {
+            XCTAssertEqual(plain[f], padded[f])
+            f += 1
+        }
+    }
 }

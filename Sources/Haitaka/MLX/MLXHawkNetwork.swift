@@ -439,8 +439,8 @@ func hawkRotary(_ x: MLXArray, cos c: MLXArray, sin s: MLXArray) -> MLXArray {
     return concatenated([x1 * c - x2 * s, x1 * s + x2 * c], axis: -1)
 }
 
-/// Griffin-style local attention block: multi-query attention over the last `window` frames (causal), then a
-/// gated MLP. See `HawkAttentionLayerWeights`.
+/// Griffin-style local attention block: multi-query or grouped-query attention over the last `window` frames
+/// (causal), then a gated MLP. See `HawkAttentionLayerWeights`.
 public final class MLXHawkAttentionLayer: Module, @unchecked Sendable {
     public var norm1: MLXArray
     public var wQ: MLXArray
@@ -454,11 +454,13 @@ public final class MLXHawkAttentionLayer: Module, @unchecked Sendable {
 
     let after: Int
     let heads: Int
+    let kvHeads: Int
     let window: Int
 
-    init(after: Int, modelDim: Int, mlpDim: Int, heads: Int, window: Int, residualScale: Float) {
+    init(after: Int, modelDim: Int, mlpDim: Int, heads: Int, kvHeads: Int, window: Int, residualScale: Float) {
         self.after = after
         self.heads = heads
+        self.kvHeads = kvHeads
         self.window = window
         let headDim = modelDim / heads
         func uniform(_ fanIn: Int, _ shape: [Int], scale: Float = 1.0) -> MLXArray {
@@ -467,8 +469,8 @@ public final class MLXHawkAttentionLayer: Module, @unchecked Sendable {
         }
         self.norm1 = MLXArray.ones([modelDim])
         self.wQ = uniform(modelDim, [modelDim, heads * headDim])
-        self.wK = uniform(modelDim, [modelDim, headDim])
-        self.wV = uniform(modelDim, [modelDim, headDim])
+        self.wK = uniform(modelDim, [modelDim, kvHeads * headDim])
+        self.wV = uniform(modelDim, [modelDim, kvHeads * headDim])
         self.wO = uniform(heads * headDim, [heads * headDim, modelDim], scale: residualScale)
         self.norm2 = MLXArray.ones([modelDim])
         self.wMLPGate = uniform(modelDim, [modelDim, mlpDim])
@@ -481,7 +483,7 @@ public final class MLXHawkAttentionLayer: Module, @unchecked Sendable {
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let batch = x.shape[0]
         let frames = x.shape[1]
-        let headDim = wK.shape[1]
+        let headDim = wK.shape[1] / kvHeads
         let half = headDim / 2
         var angles = [Float](repeating: 0.0, count: frames * half)
         var t = 0
@@ -500,9 +502,22 @@ public final class MLXHawkAttentionLayer: Module, @unchecked Sendable {
         let n = hawkRMSNorm(x, norm1)
         let q = hawkRotary(matmul(n, wQ).reshaped([batch, frames, heads, headDim]),
                            cos: cosT.reshaped([frames, 1, half]), sin: sinT.reshaped([frames, 1, half])) * (1.0 / sqrt(Float(headDim)))
-        let k = hawkRotary(matmul(n, wK), cos: cosT, sin: sinT)
-        let v = matmul(n, wV)
-        let out = MLXLocalAttention.attend(q, k, v, window: window)
+        let k = hawkRotary(matmul(n, wK).reshaped([batch, frames, kvHeads, headDim]),
+                           cos: cosT.reshaped([frames, 1, half]), sin: sinT.reshaped([frames, 1, half]))
+        let v = matmul(n, wV).reshaped([batch, frames, kvHeads, headDim])
+        // Each key/value head serves its own group of query heads; the kernel handles one shared head at a time.
+        let group = heads / kvHeads
+        var parts: [MLXArray] = []
+        var g = 0
+        while g < kvHeads {
+            parts.append(MLXLocalAttention.attend(q[0..., 0..., (g * group)..<((g + 1) * group), 0...],
+                                                  k[0..., 0..., g, 0...], v[0..., 0..., g, 0...], window: window))
+            g += 1
+        }
+        var out = parts[0]
+        if 1 < kvHeads {
+            out = concatenated(parts, axis: 2)
+        }
         let mixed = x + matmul(out.reshaped([batch, frames, heads * headDim]), wO)
         let m = hawkRMSNorm(mixed, norm2)
         return mixed + matmul(hawkGelu(matmul(m, wMLPGate)) * matmul(m, wMLPUp), wMLPDown)
@@ -542,6 +557,7 @@ public final class MLXHawkNetwork: Module, @unchecked Sendable {
         outputDim: Int,
         attentionAfter: [Int] = [],
         attentionHeads: Int = HawkShape.attentionHeads,
+        attentionKVHeads: Int = HawkShape.attentionKVHeads,
         attentionWindow: Int = HawkShape.attentionWindow
     ) {
         self.inputDim = inputDim
@@ -568,7 +584,8 @@ public final class MLXHawkNetwork: Module, @unchecked Sendable {
         self.layers = built
         let blockScale = 1.0 / sqrt(Float(2 * (numLayers + attentionAfter.count)))
         self.attention = attentionAfter.sorted().map { after in
-            MLXHawkAttentionLayer(after: after, modelDim: modelDim, mlpDim: mlpDim, heads: attentionHeads, window: attentionWindow, residualScale: blockScale)
+            MLXHawkAttentionLayer(after: after, modelDim: modelDim, mlpDim: mlpDim, heads: attentionHeads, kvHeads: attentionKVHeads,
+                                  window: attentionWindow, residualScale: blockScale)
         }
         self.finalNorm = MLXArray.ones([modelDim])
         let outBound = sqrt(3.0 / Float(modelDim))
@@ -606,6 +623,7 @@ public final class MLXHawkNetwork: Module, @unchecked Sendable {
             outputDim: weights.outputDim,
             attentionAfter: weights.attention.map { $0.after },
             attentionHeads: max(1, weights.attentionHeads),
+            attentionKVHeads: max(1, weights.attentionKVHeads),
             attentionWindow: max(1, weights.attentionWindow)
         )
         importWeights(from: weights)
@@ -700,8 +718,8 @@ public final class MLXHawkNetwork: Module, @unchecked Sendable {
             let hd = w.attentionHeadDim
             items.append((p + "norm1", MLXArray(aw.norm1, [d])))
             items.append((p + "wQ", MLXArray(aw.wQ, [d, w.attentionHeads * hd])))
-            items.append((p + "wK", MLXArray(aw.wK, [d, hd])))
-            items.append((p + "wV", MLXArray(aw.wV, [d, hd])))
+            items.append((p + "wK", MLXArray(aw.wK, [d, w.attentionKVHeads * hd])))
+            items.append((p + "wV", MLXArray(aw.wV, [d, w.attentionKVHeads * hd])))
             items.append((p + "wO", MLXArray(aw.wO, [w.attentionHeads * hd, d])))
             items.append((p + "norm2", MLXArray(aw.norm2, [d])))
             items.append((p + "wMLPGate", MLXArray(aw.wMLPGate, [d, m])))

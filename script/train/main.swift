@@ -38,6 +38,8 @@ enum Defaults {
     /// Width ratio beyond which the frame budget stops shrinking, so long utterances at 4× width are not split into
     /// many small batches (each one a full Adam step).
     static let maxBudgetWidthRatio = 2.0
+    /// Silence after each evaluated utterance (0.32 s = 8 frames).
+    static let evalTailSamples = 5120
     /// Seeds weight initialization, batch order and augmentation, so two runs differ only by their data.
     static let seed: UInt64 = 1
     /// Batches within this window are reordered so equal padded lengths run back to back; compiled steps
@@ -845,7 +847,10 @@ DispatchQueue.concurrentPerform(iterations: evalWorkers) { worker in
             continue
         }
         let pcm16k = SpeechDataset.resampleTo16k(pcmData: wavData.pcmData, sampleRate: wavData.sampleRate)
-        let features = SpeechDataset.extractFeaturesFromPCM(pcmData: pcm16k)
+        // Utterances are cut at their last word, so 0.32 s of silence follows them for the lookahead, as the post-roll
+        // of a stream's speech chunks does; the gain stays that of the utterance.
+        let features = SpeechDataset.extractFeaturesFromPCM(pcmData: pcm16k + [Float](repeating: 0.0, count: Defaults.evalTailSamples),
+                                                            rmsSampleCount: pcm16k.count)
         let kana = ctcDecoder.decode(logProbs: model.logProbs(features: features)).text
         let kanji = kanjiDecoder.decode(kanaText: kana)
         let targetKana = converter.convertToHiragana(pair.text)

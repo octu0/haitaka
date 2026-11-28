@@ -16,8 +16,11 @@ public enum HawkShape {
     public static let convRight = 2
     /// Griffin-style local attention blocks, each run after the recurrent layer with this index.
     public static let attentionAfter = [3, 7]
-    /// Query heads of the local attention; keys and values share one head (multi-query).
+    /// Query heads of the local attention.
     public static let attentionHeads = 8
+    /// Key/value heads of the local attention; each serves attentionHeads / attentionKVHeads query heads
+    /// (1: multi-query, a divisor of attentionHeads: grouped-query).
+    public static let attentionKVHeads = 1
     /// Frames each query may look back over (2.56 s at 40 ms), the current frame included. Strictly causal.
     public static let attentionWindow = 64
 }
@@ -115,6 +118,14 @@ public struct HawkWeights: Sendable, Equatable {
         return modelDim / attentionHeads
     }
 
+    /// Key/value heads of the local attention, read from the key projection's width; 0 without attention.
+    public var attentionKVHeads: Int {
+        if attention.isEmpty || attentionHeadDim <= 0 {
+            return 0
+        }
+        return attention[0].wK.count / (modelDim * attentionHeadDim)
+    }
+
     /// Convolution taps: `convWidth - 1` past, the current frame, and `convRight` future.
     public var convTaps: Int {
         return convWidth + convRight
@@ -210,8 +221,8 @@ public struct HawkWeights: Sendable, Equatable {
             tensors += [
                 (p + "norm1", T(shape: [modelDim], values: block.norm1)),
                 (p + "wQ", T(shape: [modelDim, attentionHeads * attentionHeadDim], values: block.wQ)),
-                (p + "wK", T(shape: [modelDim, attentionHeadDim], values: block.wK)),
-                (p + "wV", T(shape: [modelDim, attentionHeadDim], values: block.wV)),
+                (p + "wK", T(shape: [modelDim, attentionKVHeads * attentionHeadDim], values: block.wK)),
+                (p + "wV", T(shape: [modelDim, attentionKVHeads * attentionHeadDim], values: block.wV)),
                 (p + "wO", T(shape: [attentionHeads * attentionHeadDim, modelDim], values: block.wO)),
                 (p + "norm2", T(shape: [modelDim], values: block.norm2)),
                 (p + "wMLPGate", T(shape: [modelDim, mlpDim], values: block.wMLPGate)),
@@ -319,15 +330,15 @@ public struct HawkLayerWeights: Sendable, Equatable {
     }
 }
 
-/// Weights of one Griffin-style local attention block (RMSNorm → multi-query attention over the last
+/// Weights of one Griffin-style local attention block (RMSNorm → multi-query or grouped-query attention over the last
 /// `attentionWindow` frames with rotary positions → residual, then RMSNorm → gated MLP → residual).
 public struct HawkAttentionLayerWeights: Sendable, Equatable {
     /// Index of the recurrent layer this block follows.
     public let after: Int
     public let norm1: [Float]       // [modelDim]
     public let wQ: [Float]          // [modelDim, heads × headDim]
-    public let wK: [Float]          // [modelDim, headDim] shared key head
-    public let wV: [Float]          // [modelDim, headDim] shared value head
+    public let wK: [Float]          // [modelDim, kvHeads × headDim] key heads, each shared by a group of query heads
+    public let wV: [Float]          // [modelDim, kvHeads × headDim] value heads
     public let wO: [Float]          // [heads × headDim, modelDim]
     public let norm2: [Float]       // [modelDim]
     public let wMLPGate: [Float]    // [modelDim, mlpDim]
